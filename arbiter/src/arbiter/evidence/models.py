@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, Optional, Tuple
 
@@ -108,7 +108,7 @@ class EvidenceNode:
     node_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     valid_time_start: Optional[datetime] = None
     valid_time_end: Optional[datetime] = None
-    asserted_at: datetime = field(default_factory=datetime.utcnow)
+    asserted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     commitment_id: Optional[str] = None
     extract_conf: float = 1.0
     artifact_id: Optional[str] = None
