@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from arbiter.api.deps import get_registry
 from arbiter.db import models as m
 from arbiter.db.session import get_session
 from arbiter.fairness import CaseRecord, compute_rule_level_disparate_impact, flagged_only
@@ -17,6 +18,19 @@ def _evidence_strength_bucket(confidence: float) -> int:
     if confidence < 0.7:
         return 1
     return 2
+
+
+@router.get("/fairness/rules")
+def list_rules(registry=Depends(get_registry)):
+    """All rule_ids across every loaded rulepack -- what the dashboard
+    enumerates before drilling into any one rule's disparate-impact
+    findings."""
+    out = []
+    for code in registry.reason_codes():
+        pack = registry.latest(code)
+        for rule in pack.rules:
+            out.append({"reason_code": code, "rule_id": rule.rule_id, "head": rule.head, "description": rule.description})
+    return out
 
 
 @router.get("/fairness/rules/{rule_id}")

@@ -88,7 +88,7 @@ def is_available() -> bool:
         return False
 
 
-def extract_vlm(artifact_id: str, image_bytes: bytes, page: int = 0, timeout: float = 60.0) -> ExtractionResult | None:
+def extract_vlm(artifact_id: str, image_bytes: bytes, page: int = 0, timeout: float = 120.0) -> ExtractionResult | None:
     settings = get_settings()
     b64 = base64.b64encode(image_bytes).decode("ascii")
 
