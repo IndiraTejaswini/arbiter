@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arbiter"
+version = "0.1.0"
+description = "Auditable dispute adjudication for Amex card-member vs. merchant chargebacks"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "psycopg[binary]>=3.2",
+    "redis>=5.1",
+    "pyyaml>=6.0",
+    "cryptography>=43.0",
+    "python-multipart>=0.0.12",
+    "sse-starlette>=2.1",
+    "httpx>=0.27",
+    "pymupdf>=1.24",
+    "jsonschema>=4.23",
+    "python-magic-bin>=0.4.14 ; platform_system == 'Windows'",
+    "python-magic>=0.4.27 ; platform_system != 'Windows'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "hypothesis>=6.115",
+    "import-linter>=2.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "."]
+
+[tool.importlinter]
+root_packages = ["arbiter", "datagen"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Referee (horn) is pure"
+type = "forbidden"
+source_modules = ["arbiter.horn"]
+forbidden_modules = [
+    "arbiter.ingest", "arbiter.advocate", "arbiter.narrate", "arbiter.db",
+    "arbiter.api", "arbiter.network", "arbiter.provenance", "arbiter.audit",
+    "sqlalchemy", "httpx", "fastapi", "redis", "openai", "anthropic",
+]
+
+[[tool.importlinter.contracts]]
+name = "Quarantine emits only typed schemas"
+type = "forbidden"
+source_modules = ["arbiter.ingest"]
+forbidden_modules = ["arbiter.horn", "arbiter.decision", "arbiter.advocate", "httpx", "requests", "urllib"]
+
+[[tool.importlinter.contracts]]
+name = "Advocates cannot write"
+type = "forbidden"
+source_modules = ["arbiter.advocate"]
+forbidden_modules = ["arbiter.audit", "arbiter.provenance.commitment"]
+
+[[tool.importlinter.contracts]]
+name = "World model is independent of the rulepack"
+type = "forbidden"
+source_modules = ["datagen.outcome", "datagen.world"]
+forbidden_modules = ["arbiter.horn", "arbiter.rulepack", "arbiter.evidence.derive"]
+
+[[tool.importlinter.contracts]]
+name = "Layering"
+type = "layers"
+layers = ["arbiter.api", "arbiter.decision", "arbiter.evidence", "arbiter.horn", "arbiter.core"]

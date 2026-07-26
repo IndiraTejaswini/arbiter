@@ -24,16 +24,15 @@ import textwrap
 from pathlib import Path
 from typing import Dict, List
 
-from packages.datalog.engine import Engine, RulePack
-from packages.datalog.loader import load_rulepack_dir
-from services.abstention.abstention import ConformalAbstentionGate, compute_confidence_vector
-from services.advocate.advocate import completeness_gap, run_dual_advocacy
-from services.audit.audit import AuditService, EventStore
-from services.counterfactual.counterfactual import counterfactuals_for_all_outcomes, load_bearing_predicates
-from services.narration.narration import render_narration_safe
-from services.provenance.provenance import ProvenanceService
-from services.referee.referee import Referee
-from packages.merkle.log import TransparencyLog
+from arbiter.horn import Engine, RulePack
+from arbiter.rulepack import load_rulepack_dir
+from arbiter.decision import ConformalAbstentionGate, compute_confidence_vector, Referee
+from arbiter.advocate import completeness_gap, run_dual_advocacy
+from arbiter.audit import AuditService, EventStore
+from arbiter.horn import counterfactuals_for_all_outcomes, load_bearing_predicates
+from arbiter.narrate import render_narration_safe
+from arbiter.provenance import ProvenanceService, TransparencyLog
+from arbiter.evidence import derive_predicate_facts
 
 from datagen.synth import Scenario, all_scenarios
 
@@ -91,7 +90,7 @@ def run_case(
             })
 
     # L2/L3: objective predicate facts + four-layer contradiction analysis.
-    facts = graph.derive_predicate_facts(rulepack.predicate_schema)
+    facts = derive_predicate_facts(graph, rulepack)
     contradictions = graph.run_contradiction_analysis()
     event_store.append(scenario.case_id, "EVIDENCE_GATHERED",
                         {"predicate_count": len(facts), "contradiction_count": len(contradictions)},
@@ -119,7 +118,7 @@ def run_case(
 
     # L4: conformal abstention gate.
     severity = graph.unresolved_severity()
-    from services.counterfactual.counterfactual import per_case_symmetry
+    from arbiter.horn import per_case_symmetry
     symmetry = per_case_symmetry(rulepack, facts)
     confidence = compute_confidence_vector(evaluation, rulepack, severity, symmetry)
     abstention_decision = abstention_gate.decide(scenario.reason_code, confidence)
