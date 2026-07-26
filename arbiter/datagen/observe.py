@@ -150,9 +150,15 @@ def _observe_f29(graph: EvidenceGraph, world: World, rng: random.Random) -> Opti
     if world.cardholder_reported_lost_stolen:
         _assert(graph, EvidenceNodeType.CLAIM, "cardholder_reported_card_lost_stolen", True,
                 ProvenanceTier.ASSERTED, rng, confidence=0.9)
-    if world.account_was_taken_over or world.velocity_anomaly:
+    # account_takeover_signal is Amex's own device/session-discontinuity
+    # DETECTOR, not a readout of ground truth -- it must not simply copy
+    # `account_was_taken_over` (that would make the F29_R_ATO rule
+    # tautologically correct by construction). Modeled as an imperfect
+    # detector: high recall, small false-positive rate.
+    ato_detected = rng.random() < (0.78 if world.account_was_taken_over else 0.06)
+    if ato_detected or world.velocity_anomaly:
         _assert(graph, EvidenceNodeType.DEVICE_SESSION, "account_takeover_signal",
-                world.account_was_taken_over, ProvenanceTier.NETWORK, rng)
+                ato_detected, ProvenanceTier.NETWORK, rng)
 
     provenance = None
     if world.merchant_uses_adec and world.prior_undisputed_count >= 1:

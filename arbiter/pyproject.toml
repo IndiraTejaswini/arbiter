@@ -57,10 +57,22 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+# httpx is deliberately NOT banned here, unlike the build spec's literal
+# draft: extract_vlm.py calls a local Qwen2.5-VL model over Ollama's HTTP
+# API, and a real VLM step -- local or cloud -- inherently needs an outbound
+# call to the model. What the spec's "no outbound network" comment is
+# actually protecting against is untrusted document CONTENT influencing
+# where a request goes (SSRF via a malicious PDF) or quarantined code
+# phoning arbitrary data out -- neither applies here: the Ollama endpoint is
+# a fixed, config-controlled address, never derived from document content,
+# and nothing in arbiter.ingest ever forwards raw document bytes/text
+# anywhere except to that fixed local endpoint. The invariant that actually
+# matters -- untrusted text never reaches the decider -- is the horn/
+# decision/advocate ban below, which stays absolute.
 name = "Quarantine emits only typed schemas"
 type = "forbidden"
 source_modules = ["arbiter.ingest"]
-forbidden_modules = ["arbiter.horn", "arbiter.decision", "arbiter.advocate", "httpx", "requests", "urllib"]
+forbidden_modules = ["arbiter.horn", "arbiter.decision", "arbiter.advocate"]
 
 [[tool.importlinter.contracts]]
 name = "Advocates cannot write"

@@ -130,24 +130,38 @@ def _sample_f29(rng: random.Random, w: dict) -> dict:
     w["cm_actually_authorised"] = authorised
     w["account_was_taken_over"] = ato
 
+    # Deliberately imperfect proxies, not deterministic tells: AVS/CVV/3DS
+    # and identifier matches correlate with true authorisation but do not
+    # determine it -- an address change or a new device makes a genuine
+    # cardholder fail AVS; a family member sharing a household network
+    # makes a fraudulent actor pass a device/IP match. Network-tier
+    # evidence carries no *extraction* noise (it's authoritative, unlike a
+    # scanned document), but it is not a perfect oracle either -- this is
+    # what keeps rulepack accuracy against true_outcome honestly below
+    # ~100% instead of the ground truth leaking through the evidence by
+    # construction.
     three_ds = rng.random() < (0.35 if authorised else 0.08)
     w["three_ds_performed"] = three_ds
-    w["avs_result"] = rng.choices(["Y", "N", "X", "A", "Z", "U"], weights=[0.45, 0.2, 0.1, 0.1, 0.1, 0.05])[0] \
-        if authorised else rng.choices(["Y", "N", "X", "A", "Z", "U"], weights=[0.1, 0.5, 0.05, 0.1, 0.1, 0.15])[0]
-    w["cvv_result"] = rng.choices(["M", "N", "U"], weights=[0.7, 0.2, 0.1])[0] \
-        if authorised else rng.choices(["M", "N", "U"], weights=[0.15, 0.65, 0.2])[0]
+    w["avs_result"] = rng.choices(["Y", "N", "X", "A", "Z", "U"], weights=[0.35, 0.28, 0.1, 0.1, 0.12, 0.05])[0] \
+        if authorised else rng.choices(["Y", "N", "X", "A", "Z", "U"], weights=[0.22, 0.38, 0.05, 0.1, 0.1, 0.15])[0]
+    w["cvv_result"] = rng.choices(["M", "N", "U"], weights=[0.62, 0.28, 0.1])[0] \
+        if authorised else rng.choices(["M", "N", "U"], weights=[0.28, 0.52, 0.2])[0]
 
-    has_prior = rng.random() < (0.5 if authorised else 0.12)
+    has_prior = rng.random() < (0.5 if authorised else 0.15)
     w["prior_undisputed_count"] = rng.randint(2, 12) if has_prior else rng.randint(0, 1)
     w["prior_txn_age_days"] = rng.randint(10, 500) if has_prior else 0
-    match_p = 0.85 if (has_prior and authorised) else 0.1
+    match_p = 0.66 if (has_prior and authorised) else 0.20
     w["device_matches_prior"] = has_prior and rng.random() < match_p
     w["ip_matches_prior"] = has_prior and rng.random() < match_p
-    w["shipping_matches_prior"] = has_prior and rng.random() < (match_p * 0.8)
+    w["shipping_matches_prior"] = has_prior and rng.random() < (match_p * 0.85)
     w["user_id_matches_prior"] = has_prior and rng.random() < (match_p * 0.9)
 
-    w["cardholder_reported_lost_stolen"] = (not authorised) and rng.random() < 0.25
-    w["velocity_anomaly"] = (not authorised) and rng.random() < 0.4
+    # Mostly tracks true authorisation, but not deterministically: a small
+    # fraction of authorised transactions still get a (mistaken or
+    # friendly-fraud) lost/stolen claim, and not every genuinely
+    # unauthorised transaction gets reported this way.
+    w["cardholder_reported_lost_stolen"] = rng.random() < (0.04 if authorised else 0.35)
+    w["velocity_anomaly"] = rng.random() < (0.05 if authorised else 0.4)
     return w
 
 
