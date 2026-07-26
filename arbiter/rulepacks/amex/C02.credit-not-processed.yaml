@@ -1,0 +1,92 @@
+# ARBITER rulepack -- Amex reason code C02: Credit Not Processed
+#
+# Card member claims a refund, cancellation credit, or return credit was
+# owed and never posted. Merchant's defense is proof the refund was issued
+# for the correct amount, or that the card member's own claim doesn't
+# satisfy the merchant's disclosed policy (e.g. return window expired
+# with no separate promise to refund anyway).
+
+rulepack_id: amex-C02-v1
+reason_code: C02
+version: "1.0.0"
+
+predicate_schema:
+  - return_delivered_to_merchant
+  - refund_issued
+  - refund_amount_matches_expected
+  - merchant_refund_promise_on_record
+  - cancellation_confirmed_by_merchant
+  - service_never_rendered
+  - return_window_expired
+  - dispute_filed_before_return_received
+  - partial_refund_issued
+  - refund_policy_disclosed_at_sale
+
+decision_predicates:
+  MERCHANT_WINS: merchant_wins
+  CARD_MEMBER_WINS: card_member_wins
+
+rules:
+  - rule_id: C02_R1
+    head: card_member_wins
+    description: The merchant received the returned item and has not refunded it.
+    body:
+      - return_delivered_to_merchant
+      - not refund_issued
+
+  - rule_id: C02_R2
+    head: card_member_wins
+    description: Merchant's own communications promised a refund that was never issued.
+    body:
+      - merchant_refund_promise_on_record
+      - not refund_issued
+
+  - rule_id: C02_R3
+    head: card_member_wins
+    description: Merchant confirmed the cancellation but never issued the corresponding credit.
+    body:
+      - cancellation_confirmed_by_merchant
+      - not refund_issued
+
+  - rule_id: C02_R4
+    head: card_member_wins
+    description: Contracted service was never rendered and no refund followed.
+    body:
+      - service_never_rendered
+      - not refund_issued
+
+  - rule_id: C02_R5
+    head: card_member_wins
+    description: >
+      A refund was issued but for the wrong amount, and no full refund
+      followed -- the shortfall itself is the unprocessed credit.
+    body:
+      - partial_refund_issued
+      - not refund_amount_matches_expected
+
+  - rule_id: C02_R6
+    head: merchant_wins
+    description: A refund was issued for the correct, expected amount.
+    body:
+      - refund_issued
+      - refund_amount_matches_expected
+
+  - rule_id: C02_R7
+    head: merchant_wins
+    description: >
+      The merchant's disclosed return window had already expired at the
+      time of the claim, and the merchant made no separate promise to
+      refund outside that policy.
+    body:
+      - refund_policy_disclosed_at_sale
+      - return_window_expired
+      - not merchant_refund_promise_on_record
+
+  - rule_id: C02_R8
+    head: merchant_wins
+    description: >
+      The card member filed the dispute before the merchant could even have
+      received the returned item, and made no separate refund promise.
+    body:
+      - dispute_filed_before_return_received
+      - not merchant_refund_promise_on_record

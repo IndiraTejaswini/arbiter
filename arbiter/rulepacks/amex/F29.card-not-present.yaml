@@ -1,0 +1,138 @@
+# ARBITER rulepack -- Amex reason code F29: Card-Not-Present Fraud
+#
+# Card member claims they did not authorize a CNP transaction. This is the
+# reason code family Visa's Compelling Evidence 3.0 targets (RC 10.4), and
+# where ADEC's generalisation of CE3.0 is most legible (§1.5, §A1):
+#
+#   - F29_CE3_* rules are a faithful encoding of CE3.0 itself: >=2 of
+#     {device_id, ip_address, shipping_address, user_id} must match a prior
+#     UNDISPUTED transaction that is 120-365 days old, with at least one of
+#     the two matches being device_id or ip_address (the network-recorded,
+#     hard-to-fake identifiers).
+#   - F29_R_ADEC_GENERALIZED drops the 120-365-day floor entirely, because
+#     ADEC proves the prior transaction's commitment predates the dispute
+#     directly -- it does not need to lean on transaction age as a
+#     backdating-resistance proxy the way CE3.0 does. This is the rule that
+#     makes CE3.0 "useless for new customers" (§1.5) not apply to ARBITER.
+
+rulepack_id: amex-F29-v1
+reason_code: F29
+version: "1.0.0"
+
+predicate_schema:
+  - prior_undisputed_txn_count_ge_2
+  - prior_txn_120_to_365_days_old
+  - device_id_match
+  - ip_address_match
+  - shipping_address_match
+  - user_id_match
+  - avs_match
+  - cvv_match
+  - three_ds_authenticated
+  - adec_prior_txn_commitments_verified
+  - cardholder_reported_card_lost_stolen
+  - account_takeover_signal
+  - velocity_anomaly_flagged
+
+decision_predicates:
+  MERCHANT_WINS: merchant_wins
+  CARD_MEMBER_WINS: card_member_wins
+
+rules:
+  # -- CE3.0-faithful family: any qualifying pair, one of which must be
+  # device_id or ip_address, over two prior undisputed transactions aged
+  # 120-365 days.
+  - rule_id: F29_CE3_device_ip
+    head: merchant_wins
+    description: "CE3.0: device_id + ip_address match on 2+ prior undisputed transactions (120-365d)."
+    body:
+      - prior_undisputed_txn_count_ge_2
+      - prior_txn_120_to_365_days_old
+      - device_id_match
+      - ip_address_match
+
+  - rule_id: F29_CE3_device_shipping
+    head: merchant_wins
+    description: "CE3.0: device_id + shipping_address match on 2+ prior undisputed transactions (120-365d)."
+    body:
+      - prior_undisputed_txn_count_ge_2
+      - prior_txn_120_to_365_days_old
+      - device_id_match
+      - shipping_address_match
+
+  - rule_id: F29_CE3_device_user
+    head: merchant_wins
+    description: "CE3.0: device_id + user_id match on 2+ prior undisputed transactions (120-365d)."
+    body:
+      - prior_undisputed_txn_count_ge_2
+      - prior_txn_120_to_365_days_old
+      - device_id_match
+      - user_id_match
+
+  - rule_id: F29_CE3_ip_shipping
+    head: merchant_wins
+    description: "CE3.0: ip_address + shipping_address match on 2+ prior undisputed transactions (120-365d)."
+    body:
+      - prior_undisputed_txn_count_ge_2
+      - prior_txn_120_to_365_days_old
+      - ip_address_match
+      - shipping_address_match
+
+  - rule_id: F29_CE3_ip_user
+    head: merchant_wins
+    description: "CE3.0: ip_address + user_id match on 2+ prior undisputed transactions (120-365d)."
+    body:
+      - prior_undisputed_txn_count_ge_2
+      - prior_txn_120_to_365_days_old
+      - ip_address_match
+      - user_id_match
+
+  # -- ARBITER's generalisation: ADEC-verified prior-transaction commitments
+  # remove the 120-365-day floor, because non-backdating is proven directly.
+  - rule_id: F29_R_ADEC_GENERALIZED
+    head: merchant_wins
+    description: >
+      ADEC-verified prior-transaction commitments plus device_id and
+      ip_address match -- valid regardless of transaction age, because
+      ADEC proves non-backdating without leaning on a 120-day floor as a
+      proxy for it. This is CE3.0 generalised from transactions to
+      arbitrary evidence artifacts (§1.5).
+    body:
+      - adec_prior_txn_commitments_verified
+      - device_id_match
+      - ip_address_match
+
+  # -- 3-D Secure liability shift
+  - rule_id: F29_R_3DS
+    head: merchant_wins
+    description: Transaction was 3-D Secure authenticated with AVS and CVV match.
+    body:
+      - three_ds_authenticated
+      - avs_match
+      - cvv_match
+
+  # -- Card-member-favoring rules
+  - rule_id: F29_R_LOST_STOLEN
+    head: card_member_wins
+    description: Card member reported the card lost or stolen prior to the transaction.
+    body:
+      - cardholder_reported_card_lost_stolen
+
+  - rule_id: F29_R_ATO
+    head: card_member_wins
+    description: >
+      Account-takeover signal present (device/session discontinuity) with
+      no 3-D Secure authentication to shift liability.
+    body:
+      - account_takeover_signal
+      - not three_ds_authenticated
+
+  - rule_id: F29_R_VELOCITY_NO_MATCH
+    head: card_member_wins
+    description: >
+      Velocity anomaly flagged and neither device nor IP matches any prior
+      transaction -- consistent with a new, unfamiliar actor.
+    body:
+      - velocity_anomaly_flagged
+      - not device_id_match
+      - not ip_address_match

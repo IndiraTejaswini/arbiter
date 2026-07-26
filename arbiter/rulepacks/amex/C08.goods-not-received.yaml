@@ -1,0 +1,99 @@
+# ARBITER rulepack -- Amex reason code C08: Goods/Services Not Received
+#
+# Card member claims purchased goods/services were never received. Merchant's
+# defense is proof of delivery to the correct party, proof of digital-goods
+# access, or evidence the card member's own cancellation was too late or
+# already refunded. This rulepack is content-addressed (see RulePack.content_hash);
+# this file is deploy-time data, never imported as code (§9.8).
+
+rulepack_id: amex-C08-v1
+reason_code: C08
+version: "1.0.0"
+
+predicate_schema:
+  - delivery_confirmed
+  - address_matches_avs
+  - signature_missing
+  - tracking_shows_delivered
+  - digital_goods_access_logged
+  - merchant_shipped_before_dispute
+  - cancellation_requested_before_shipment
+  - refund_already_issued
+  - cardholder_confirmed_receipt
+  - adec_shipment_commitment_verified
+  - delivery_address_mismatch
+  - carrier_exception_reported
+
+decision_predicates:
+  MERCHANT_WINS: merchant_wins
+  CARD_MEMBER_WINS: card_member_wins
+
+rules:
+  - rule_id: C08_R1
+    head: merchant_wins
+    description: >
+      Delivery confirmed to the AVS-verified address with no missing
+      required signature. The canonical proof-of-delivery defense.
+    body:
+      - delivery_confirmed
+      - address_matches_avs
+      - not signature_missing
+
+  - rule_id: C08_R2
+    head: merchant_wins
+    description: >
+      Digital goods: server-side access/download logs show the card member
+      used the purchased good after the order. Physical delivery proof does
+      not apply to this category.
+    body:
+      - digital_goods_access_logged
+
+  - rule_id: C08_R3
+    head: merchant_wins
+    description: >
+      ADEC-verified shipment commitment (pre-dispute, non-backdatable) plus
+      carrier delivery confirmation, with no address mismatch. Higher-trust
+      path: the shipment event was committed before the dispute could exist.
+    body:
+      - adec_shipment_commitment_verified
+      - tracking_shows_delivered
+      - not delivery_address_mismatch
+
+  - rule_id: C08_R4
+    head: merchant_wins
+    description: The card member's own communications acknowledge receipt.
+    body:
+      - cardholder_confirmed_receipt
+
+  - rule_id: C08_R5
+    head: card_member_wins
+    description: >
+      Nothing was ever confirmed delivered, the merchant did not ship before
+      the dispute was filed, and the carrier logged an explicit delivery
+      exception (lost, returned-to-sender, failed delivery attempt).
+    body:
+      - not delivery_confirmed
+      - not merchant_shipped_before_dispute
+      - carrier_exception_reported
+
+  - rule_id: C08_R6
+    head: card_member_wins
+    description: >
+      Card member cancelled before the merchant shipped, and no refund has
+      been issued for the cancelled order.
+    body:
+      - cancellation_requested_before_shipment
+      - not refund_already_issued
+
+  # Deliberately no "merchant produced nothing" rule keyed on mere absence
+  # of evidence: under this engine's closed-world semantics, a rule that
+  # fires on the *absence* of merchant-favoring predicates is trivially
+  # satisfied by the empty evidence set -- its own prime implicant is {} --
+  # which silently dominates every other card_member_wins rule and revives
+  # exactly the R03/R13 default-to-cardmember failure mode §1.2b and §9.5
+  # name as the sharpest fairness defect in the status quo. A case with
+  # genuinely no resolving evidence must abstain (decision=None) and route
+  # through Advocate-M's search over Amex-side data before any default
+  # applies -- never resolve via a hard-coded rule. Caught by this
+  # rulepack's own property tests (see evals/property_tests.py:
+  # test_no_trivial_prime_implicant).
