@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arbiter.internal/rulepacks/predicates.schema.json",
+  "title": "ARBITER rulepack",
+  "description": "Structural schema for a rulepack YAML file (rulepacks/amex/*.yaml). Validated by arbiter.rulepack.validate at load time; this file documents the same contract for humans and external tooling (e.g. a rulepack-authoring linter in CI).",
+  "type": "object",
+  "required": ["rulepack_id", "reason_code", "version", "decision_predicates", "rules"],
+  "properties": {
+    "rulepack_id": {
+      "type": "string",
+      "description": "Stable identifier, e.g. 'amex-F29-v1'. Not the content hash -- RulePack.content_hash() is computed over the parsed structure at load time, so this field can stay stable across content changes if desired."
+    },
+    "reason_code": { "type": "string", "description": "The Amex/network reason code this rulepack adjudicates, e.g. 'F29'." },
+    "version": { "type": "string" },
+    "predicate_schema": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "The full universe of EDB (evidence-derived) predicate names this rulepack's rules reference. Used for missing_predicates / completeness reporting -- every predicate referenced by a rule body should appear here (arbiter.rulepack.validate enforces this)."
+    },
+    "predicates": {
+      "type": "array",
+      "description": "Optional per-predicate metadata (C2: provenance tier gating). If omitted, tier gating for that predicate is not enforced at derivation and it may be satisfied by any tier -- omit only for predicates where that is genuinely acceptable.",
+      "items": {
+        "type": "object",
+        "required": ["id"],
+        "properties": {
+          "id": { "type": "string" },
+          "party": { "type": "string", "enum": ["CARD_MEMBER", "MERCHANT", "NEUTRAL"] },
+          "min_tier": { "type": "string", "enum": ["COMMITTED", "NETWORK", "SUBMITTED", "ASSERTED"] }
+        }
+      }
+    },
+    "decision_predicates": {
+      "type": "object",
+      "description": "Maps an outcome name (e.g. 'MERCHANT_WINS') to the head predicate a rule must derive to produce that outcome.",
+      "additionalProperties": { "type": "string" }
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["rule_id", "head", "body"],
+        "properties": {
+          "rule_id": { "type": "string" },
+          "head": { "type": "string", "description": "The predicate this rule derives when its body is satisfied." },
+          "body": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Conjunction of literals. A literal is a predicate name, or 'not <predicate>' for negation. Negation is restricted to EDB predicates (arbiter.horn.clause's module docstring) -- negating a head predicate raises StratificationError at load time."
+          },
+          "description": { "type": "string" }
+        }
+      }
+    }
+  }
+}
