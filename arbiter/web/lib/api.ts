@@ -40,6 +40,7 @@ export type DecisionResponse = {
   conformal_set: string[];
   rulepack_hash: string;
   merchant_silent: boolean;
+  llm_rejections: number;
   proof_tree: ProofNode | null;
   counterfactuals: Record<string, Counterfactual>;
   escalation_reason: string | null;

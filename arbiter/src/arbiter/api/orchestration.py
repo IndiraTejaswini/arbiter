@@ -29,7 +29,8 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from arbiter.advocate import run_dual_advocacy
+from arbiter.advocate import run_dual_advocacy, run_llm_advocate
+from arbiter.advocate.contract import ArgumentGraph
 from arbiter.audit.sign import EventSigner
 from arbiter.db import models as m
 from arbiter.decision import (
@@ -177,15 +178,47 @@ def adjudicate_case(
     publish_stage(str(case_id), "CONSTRUCTING_ARGUMENTS", "Running dual-advocate search", 0.60)
     cm_graph, m_graph = run_dual_advocacy(rulepack, predicate_facts)
 
+    # LLM BOUNDARY 3, turned up: an LLM advocate per side, ADDITIVE only.
+    # Every proposed assertion is re-derived from the objective facts by the
+    # same verify_assertions the deterministic path uses below -- nothing
+    # here can introduce a predicate into truth, only enlarge an
+    # already-valid ArgumentGraph with independently-confirmed triples.
+    # Deterministic search stays authoritative and this never blocks on the
+    # LLM being available (arbiter.advocate.llm_runner returns ([], []) if
+    # unreachable).
+    llm_rejections = 0
+    cm_llm_triples, cm_llm_verifications = run_llm_advocate(rulepack, graph, predicate_facts, "CM", cm_graph.target_outcome)
+    m_llm_triples, m_llm_verifications = run_llm_advocate(rulepack, graph, predicate_facts, "M", m_graph.target_outcome)
+    llm_rejections += sum(1 for v in cm_llm_verifications if not v.verified)
+    llm_rejections += sum(1 for v in m_llm_verifications if not v.verified)
+
+    if cm_llm_triples:
+        existing = {(t.predicate, t.negated) for t in cm_graph.triples}
+        new_triples = tuple(t for t in cm_llm_triples if (t.predicate, t.negated) not in existing)
+        cm_graph = ArgumentGraph(
+            side=cm_graph.side, target_outcome=cm_graph.target_outcome, target_head=cm_graph.target_head,
+            triples=cm_graph.triples + new_triples, missing_literals=cm_graph.missing_literals,
+            fully_satisfied=cm_graph.fully_satisfied, best_mwc=cm_graph.best_mwc,
+        )
+    if m_llm_triples:
+        existing = {(t.predicate, t.negated) for t in m_graph.triples}
+        new_triples = tuple(t for t in m_llm_triples if (t.predicate, t.negated) not in existing)
+        m_graph = ArgumentGraph(
+            side=m_graph.side, target_outcome=m_graph.target_outcome, target_head=m_graph.target_head,
+            triples=m_graph.triples + new_triples, missing_literals=m_graph.missing_literals,
+            fully_satisfied=m_graph.fully_satisfied, best_mwc=m_graph.best_mwc,
+        )
+
     publish_stage(str(case_id), "ADJUDICATING", "Evaluating rulepack", 0.75)
     referee = Referee()
     referee_result = referee.adjudicate(rulepack, [cm_graph, m_graph], predicate_facts)
     evaluation = referee_result.evaluation
+    llm_rejections += len(referee_result.rejected_triples)
 
     counterfactuals = counterfactuals_for_all_outcomes(rulepack, predicate_facts)
     symmetry = per_case_symmetry(rulepack, predicate_facts)
     severity = graph.unresolved_severity()
-    confidence = compute_confidence_vector(evaluation, rulepack, severity, symmetry)
+    confidence = compute_confidence_vector(evaluation, rulepack, severity, symmetry, rejected_assertions=llm_rejections)
     abstention = abstention_gate.decide(reason_code, confidence)
 
     valid_node_ids = set(graph.nodes.keys())
@@ -214,10 +247,18 @@ def adjudicate_case(
         abstained=not abstention.auto_resolve,
         escalation_reason=None if abstention.auto_resolve else abstention.reason,
         merchant_silent=not case.merchant_responded,
+        llm_rejections=llm_rejections,
         signature=_signer.sign(json.dumps(decision_payload, sort_keys=True, default=str).encode("utf-8")),
     )
     session.add(decision_row)
     session.flush()
+
+    if llm_rejections:
+        _append_event(
+            session, case_id, "LLM_ASSERTIONS_REJECTED",
+            {"count": llm_rejections, "note": "caught by verify_assertions before reaching the referee"},
+            "advocate-service", "advocate",
+        )
 
     for rule_id in evaluation.fired_rules:
         session.add(m.RuleFiringRow(decision_id=decision_row.decision_id, rule_id=rule_id, fired=True))

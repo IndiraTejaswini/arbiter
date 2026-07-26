@@ -12,6 +12,7 @@ type StageMessage = {
 };
 
 const STAGE_ORDER = [
+  "CLASSIFYING",
   "GATHERING_NETWORK",
   "PARSING_EVIDENCE",
   "VERIFYING_PROVENANCE",

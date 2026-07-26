@@ -41,6 +41,7 @@ def get_decision(case_id: uuid.UUID, session: Session = Depends(get_session)):
         "conformal_set": decision.conformal_set,
         "rulepack_hash": f"sha256:{decision.rulepack_hash.hex()}",
         "merchant_silent": decision.merchant_silent,
+        "llm_rejections": decision.llm_rejections,
         "proof_tree": decision.proof_tree,
         "counterfactuals": decision.counterfactuals,
         "escalation_reason": decision.escalation_reason,

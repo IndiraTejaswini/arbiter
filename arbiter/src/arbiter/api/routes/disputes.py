@@ -13,6 +13,8 @@ from arbiter.api.deps import get_abstention_gate, get_registry
 from arbiter.api.orchestration import adjudicate_case
 from arbiter.db import models as m
 from arbiter.db.session import get_session
+from arbiter.intake import classify_intent, verify_intent
+from arbiter.realtime.events import publish_stage
 
 router = APIRouter(prefix="/v1", tags=["disputes"])
 
@@ -24,8 +26,25 @@ _idempotency_cache: dict[str, uuid.UUID] = {}
 
 class CreateDisputeRequest(BaseModel):
     transaction_id: uuid.UUID
-    reason_code: str
+    reason_code: Optional[str] = None
+    complaint_text: Optional[str] = None
     reg_regime: str = "REG_Z"
+
+
+class IntentNotResolvedResponse(BaseModel):
+    """Returned instead of a 201 when neither `reason_code` nor a confident
+    classification of `complaint_text` is available -- no case is created.
+    CLAUDE.md: the intent classifier never guesses a rulepack. The caller
+    either re-POSTs with the confirmed `reason_code`, or the complaint goes
+    to human triage."""
+
+    resolved: bool = False
+    proposed_reason_code: Optional[str]
+    confidence: Optional[float]
+    signals: list[str]
+    needs_user_confirmation: bool
+    route_to_human_triage: bool
+    reason: str
 
 
 class DisputeCaseOut(BaseModel):
@@ -34,6 +53,7 @@ class DisputeCaseOut(BaseModel):
     card_member_id: uuid.UUID
     merchant_id: uuid.UUID
     reason_code: str
+    intent_confidence: Optional[float]
     state: str
     amount_minor: int
     currency: str
@@ -46,19 +66,19 @@ class DisputeCaseOut(BaseModel):
     def from_row(cls, row: m.DisputeCase) -> "DisputeCaseOut":
         return cls(
             case_id=row.case_id, transaction_id=row.transaction_id, card_member_id=row.card_member_id,
-            merchant_id=row.merchant_id, reason_code=row.reason_code, state=row.state.value,
-            amount_minor=row.amount_minor, currency=row.currency, filed_at=row.filed_at,
+            merchant_id=row.merchant_id, reason_code=row.reason_code, intent_confidence=row.intent_confidence,
+            state=row.state.value, amount_minor=row.amount_minor, currency=row.currency, filed_at=row.filed_at,
             ack_deadline=row.ack_deadline, resolve_deadline=row.resolve_deadline,
             merchant_responded=row.merchant_responded,
         )
 
 
-@router.post("/disputes", response_model=DisputeCaseOut, status_code=201)
+@router.post("/disputes", status_code=201, response_model=None)
 def create_dispute(
     body: CreateDisputeRequest,
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     session: Session = Depends(get_session),
-):
+) -> DisputeCaseOut | IntentNotResolvedResponse:
     if not idempotency_key:
         raise HTTPException(400, "Idempotency-Key header is required")
     if idempotency_key in _idempotency_cache:
@@ -72,12 +92,42 @@ def create_dispute(
     if seed is None:
         raise HTTPException(404, f"unknown transaction_id {body.transaction_id}")
 
+    intent_confidence: Optional[float] = None
+    reason_code = body.reason_code
+
+    if reason_code is None:
+        # LLM BOUNDARY 1: classify, then verify. The classifier never picks
+        # the rulepack directly -- verify_intent does, and only when it
+        # clears the confidence gate and resolves to a rulepack we actually
+        # loaded.
+        if not body.complaint_text:
+            raise HTTPException(400, "either reason_code or complaint_text is required")
+        publish_stage(str(body.transaction_id), "CLASSIFYING", "Classifying complaint intent", 0.05)
+        result = classify_intent(
+            body.complaint_text, merchant_descriptor=str(seed.merchant_id),
+            amount_minor=seed.amount_minor, currency=seed.currency,
+            transaction_date=seed.transaction_at.isoformat(),
+        )
+        decision = verify_intent(result, set(get_registry().reason_codes()))
+        if not decision.resolved:
+            return IntentNotResolvedResponse(
+                proposed_reason_code=decision.reason_code,
+                confidence=result.confidence if result else None,
+                signals=list(result.signals) if result else [],
+                needs_user_confirmation=decision.needs_user_confirmation,
+                route_to_human_triage=decision.route_to_human_triage,
+                reason=decision.reason,
+            )
+        reason_code = decision.reason_code
+        intent_confidence = result.confidence if result else None
+
     now = datetime.now(timezone.utc)
     case = m.DisputeCase(
         transaction_id=seed.transaction_id,
         card_member_id=seed.card_member_id,
         merchant_id=seed.merchant_id,
-        reason_code=body.reason_code,
+        reason_code=reason_code,
+        intent_confidence=intent_confidence,
         state=m.CaseStateEnum.INTAKE,
         amount_minor=seed.amount_minor,
         currency=seed.currency,

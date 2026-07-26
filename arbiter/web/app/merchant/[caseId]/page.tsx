@@ -93,6 +93,14 @@ export default function MerchantConsolePage({ params }: { params: Promise<{ case
             would have been an automatic concession.
           </div>
         )}
+        {decision && decision.llm_rejections > 0 && (
+          <div className="mt-3 rounded border border-neutral-300 bg-neutral-50 p-3 text-sm text-neutral-600 dark:border-neutral-700 dark:bg-neutral-900 dark:text-neutral-400">
+            🛡 {decision.llm_rejections} advocate assertion{decision.llm_rejections > 1 ? "s" : ""} could not be
+            independently verified against the evidence graph and{" "}
+            {decision.llm_rejections > 1 ? "were" : "was"} discarded before adjudication — this did not change
+            the outcome, only what the referee was allowed to see.
+          </div>
+        )}
       </header>
 
       <StatusStream caseId={caseId} onTerminal={load} />

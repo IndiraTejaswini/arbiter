@@ -15,6 +15,7 @@ import redis
 from arbiter.config import get_settings
 
 STAGES = (
+    "CLASSIFYING",
     "GATHERING_NETWORK",
     "PARSING_EVIDENCE",
     "VERIFYING_PROVENANCE",

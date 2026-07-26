@@ -47,12 +47,17 @@ root_packages = ["arbiter", "datagen"]
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
-name = "Referee (horn) is pure"
+# The mechanical guarantee that no LLM can reach the decider: horn cannot
+# reach arbiter.llm (the shared Ollama client), arbiter.intake (the intent
+# classifier), or any other LLM/HTTP-touching module, directly or
+# transitively.
+name = "Referee (horn) is pure -- the only decider touches no LLM"
 type = "forbidden"
 source_modules = ["arbiter.horn"]
 forbidden_modules = [
-    "arbiter.ingest", "arbiter.advocate", "arbiter.narrate", "arbiter.db",
-    "arbiter.api", "arbiter.network", "arbiter.provenance", "arbiter.audit",
+    "arbiter.ingest", "arbiter.advocate", "arbiter.narrate", "arbiter.intake",
+    "arbiter.llm", "arbiter.db", "arbiter.api", "arbiter.network",
+    "arbiter.provenance", "arbiter.audit",
     "sqlalchemy", "httpx", "fastapi", "redis", "openai", "anthropic",
 ]
 

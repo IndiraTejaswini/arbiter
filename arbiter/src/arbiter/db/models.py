@@ -122,6 +122,7 @@ class DisputeCase(Base):
     card_member_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     merchant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     reason_code: Mapped[str] = mapped_column(String, nullable=False)
+    intent_confidence: Mapped[Optional[float]] = mapped_column(REAL, nullable=True)  # from arbiter.intake, NULL if reason_code was given directly
     state: Mapped[CaseStateEnum] = mapped_column(
         Enum(CaseStateEnum, name="case_state", native_enum=True), nullable=False, default=CaseStateEnum.INTAKE
     )
@@ -265,6 +266,7 @@ class DecisionRow(Base):
     abstained: Mapped[bool] = mapped_column(nullable=False)
     escalation_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     merchant_silent: Mapped[bool] = mapped_column(nullable=False, default=False)  # R13-recovery metric
+    llm_rejections: Mapped[int] = mapped_column(nullable=False, default=0)  # hallucinated advocate assertions caught this case
     decided_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
     signature: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
 
