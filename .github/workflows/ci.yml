@@ -145,7 +145,7 @@ jobs:
           cache: pip
 
       - name: Install pinned tooling
-        run: python -m pip install --upgrade pip "pip-tools>=7.4.1" pip-audit cyclonedx-bom
+        run: python -m pip install --upgrade "pip==24.3.1" "pip-tools==7.4.1" pip-audit cyclonedx-bom
 
       # The lockfile is the supply-chain boundary. If it no longer matches
       # pyproject.toml, the image is being built from dependencies nobody
