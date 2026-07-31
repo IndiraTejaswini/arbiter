@@ -3,7 +3,6 @@ import { ApiError, login } from "@/lib/api";
 import type { Session } from "@/lib/session";
 import type { Role } from "@/lib/types";
 import { Button, Card, CardBody, Field, Select, TextInput } from "./ui";
-import { cx } from "@/lib/format";
 
 /**
  * Sign-in.
