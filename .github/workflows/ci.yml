@@ -141,16 +141,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
           cache: pip
 
       - name: Install pinned tooling
         run: python -m pip install --upgrade "pip==24.3.1" "pip-tools==7.4.1" pip-audit cyclonedx-bom
 
-      # The lockfile is the supply-chain boundary. If it no longer matches
-      # pyproject.toml, the image is being built from dependencies nobody
-      # reviewed -- so a drifted lockfile fails the build rather than being
-      # silently regenerated.
+      # The lockfile is the supply-chain boundary. It must be regenerated on
+      # the same Python family that the committed file was produced with, or
+      # the hash set and platform-specific markers drift and the repo fails
+      # its own reproducibility gate.
       - name: Lockfile is in sync with pyproject.toml
         run: |
           cp requirements.lock requirements.lock.committed
