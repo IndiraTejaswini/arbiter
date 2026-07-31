@@ -1,6 +1,7 @@
-from . import audit, commitments, decisions, disputes, evidence, fairness, rulepacks, stream
+from . import audit, auth, commitments, decisions, disputes, evidence, fairness, rulepacks, stream
 
 ALL_ROUTERS = [
+    auth.router,
     disputes.router,
     evidence.router,
     decisions.router,

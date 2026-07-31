@@ -54,6 +54,7 @@ class CaseEvent:
     event_hash: bytes
     signature: bytes
     rulepack_hash: Optional[str] = None
+    key_epoch: int = 0  # which EventSigner epoch produced `signature` -- see arbiter.audit.sign
 
     def to_dict(self) -> dict:
         return {
@@ -68,6 +69,7 @@ class CaseEvent:
             "event_hash": self.event_hash.hex(),
             "signature": self.signature.hex(),
             "rulepack_hash": self.rulepack_hash,
+            "key_epoch": self.key_epoch,
         }
 
 
@@ -146,6 +148,7 @@ class EventStore:
             event_hash=event_hash,
             signature=signature,
             rulepack_hash=rulepack_hash,
+            key_epoch=self.signer.epoch,
         )
         events.append(event)
         return event

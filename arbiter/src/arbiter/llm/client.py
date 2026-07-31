@@ -56,8 +56,31 @@ def complete_json(
     try:
         resp = httpx.post(f"{settings.ollama_base_url}/api/generate", json=payload, timeout=timeout)
         resp.raise_for_status()
-        return json.loads(resp.json()["response"])
-    except (httpx.HTTPError, httpx.TimeoutException, KeyError, ValueError, json.JSONDecodeError):
+        body = resp.json()
+        if not isinstance(body, dict):
+            return None
+        completion = body.get("response")
+        # `json.loads` raises TypeError -- not ValueError -- on a non-str
+        # argument, so `{"response": null}` or a response field that already
+        # arrived as an object used to escape the handler below and crash the
+        # caller. That is a direct breach of this module's own contract and
+        # of CLAUDE.md #11: every LLM call site returns None on ANY failure,
+        # because callers treat None as a routing signal and have no branch
+        # for an exception.
+        if not isinstance(completion, str):
+            return None
+        parsed = json.loads(completion)
+        # Constrained decoding should guarantee an object, but the return
+        # type says `dict` and a bare list or string would satisfy `json.loads`
+        # while breaking every caller's `.get(...)`. Enforce the annotation
+        # rather than trusting the server to honour the schema.
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        # Deliberately total. A malformed base URL raises `httpx.InvalidURL`,
+        # which is not an `HTTPError`; a proxy or DNS misconfiguration can
+        # surface as something else again. Enumerating exception types at a
+        # boundary whose entire contract is "never raises" means the contract
+        # holds only for the failures somebody thought of.
         return None
 
 
@@ -68,7 +91,14 @@ def is_available(model: Optional[str] = None) -> bool:
         resp = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=2.0)
         if resp.status_code != 200:
             return False
-        names = [m["name"] for m in resp.json().get("models", [])]
+        body = resp.json()
+        if not isinstance(body, dict):
+            return False
+        names = [
+            m.get("name", "") for m in body.get("models", []) if isinstance(m, dict)
+        ]
         return any(target in name for name in names)
-    except (httpx.HTTPError, httpx.TimeoutException, KeyError, ValueError):
+    except Exception:
+        # Same reasoning as `complete_json`: an availability probe that can
+        # itself raise is worse than one that reports "unavailable".
         return False

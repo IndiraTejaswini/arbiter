@@ -24,16 +24,14 @@ import textwrap
 from pathlib import Path
 from typing import Dict, List
 
-from arbiter.horn import Engine, RulePack
-from arbiter.rulepack import load_rulepack_dir
-from arbiter.decision import ConformalAbstentionGate, compute_confidence_vector, Referee
 from arbiter.advocate import completeness_gap, run_dual_advocacy
 from arbiter.audit import AuditService, EventStore
-from arbiter.horn import counterfactuals_for_all_outcomes, load_bearing_predicates
-from arbiter.narrate import render_narration_safe
-from arbiter.provenance import ProvenanceService, TransparencyLog
+from arbiter.decision import ConformalAbstentionGate, Referee, compute_confidence_vector
 from arbiter.evidence import derive_predicate_facts
-
+from arbiter.horn import Engine, RulePack, counterfactuals_for_all_outcomes, load_bearing_predicates
+from arbiter.narrate import render_narration_safe
+from arbiter.provenance import TransparencyLog
+from arbiter.rulepack import load_rulepack_dir
 from datagen.synth import Scenario, all_scenarios
 
 RULEPACK_DIR = Path(__file__).resolve().parent / "rulepacks" / "amex"

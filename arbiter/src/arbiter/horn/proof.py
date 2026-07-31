@@ -36,6 +36,7 @@ class ProofNode:
     holds: bool
     literals: List["LiteralWitness"] = field(default_factory=list)
     description: str = ""
+    legal_basis: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -43,6 +44,7 @@ class ProofNode:
             "head": self.head,
             "holds": self.holds,
             "description": self.description,
+            "legal_basis": self.legal_basis,
             "literals": [w.to_dict() for w in self.literals],
         }
 

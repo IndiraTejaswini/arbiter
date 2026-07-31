@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from arbiter.llm.client import complete_json, is_available
+from arbiter.privacy.redact import redact_text
 
 _SCHEMA = {
     "type": "object",
@@ -72,9 +73,15 @@ def classify_intent(
     if not is_available():
         return None
 
+    # PII redaction at the LLM-prompt boundary (arbiter.privacy.redact):
+    # a complaint's card number, SSN, email, or phone number is never
+    # needed to classify intent into a reason-code bucket, and never
+    # belongs in a prompt sent to a model, local or hosted.
+    redacted_complaint, _ = redact_text(complaint)
+
     prompt = _PROMPT_TEMPLATE.format(
         merchant_descriptor=merchant_descriptor, amount=amount_minor / 100, currency=currency,
-        transaction_date=transaction_date, complaint=complaint,
+        transaction_date=transaction_date, complaint=redacted_complaint,
     )
     parsed = complete_json(prompt, _SCHEMA)
     if parsed is None:

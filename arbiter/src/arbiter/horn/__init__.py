@@ -7,10 +7,8 @@ SQLAlchemy, no HTTP clients, no LLM SDKs. Enforced by import-linter
 tree over booleans, produced by propositional Horn forward chaining.
 """
 
-from .clause import Literal, Rule, RulePack, StratificationError
-from .proof import Fact, FactStatus, LiteralWitness, ProofNode
 from .chain import Engine, EvaluationResult
-from .implicants import PrimeImplicant, enumerate_prime_implicants
+from .clause import Literal, Rule, RulePack, StratificationError
 from .counterfactual import (
     Counterfactual,
     CounterfactualItem,
@@ -20,6 +18,8 @@ from .counterfactual import (
     minimal_delta,
     per_case_symmetry,
 )
+from .implicants import PrimeImplicant, enumerate_prime_implicants
+from .proof import Fact, FactStatus, LiteralWitness, ProofNode
 
 __all__ = [
     "Literal", "Rule", "RulePack", "StratificationError",

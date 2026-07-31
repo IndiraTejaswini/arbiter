@@ -17,7 +17,134 @@
 
 rulepack_id: amex-F29-v1
 reason_code: F29
-version: "1.0.0"
+version: "1.1.0"
+
+# Party-facing catalogue metadata -- prose about the rules, not a check, so
+# neither field enters content_hash(). See C08's rulepack for the full note
+# on why this lives here rather than in the console.
+title: Card-not-present fraud
+description: A charge you did not authorise, made without the card present.
+
+# -- The chargeback right itself (arbiter.eligibility) --------------------
+#
+# Transcribed from American Express's own merchant guide, "Chargeback Codes
+# -- What they mean" (Australian merchant reason codes), Reason Code 4540
+# "Card Not Present", pp.17-20. F29 is ARBITER's internal name for the same
+# dispute; `network_code` is what an Amex merchant actually sees in the
+# "Resolve Disputes" area of their merchant account.
+#
+# WHY THIS IS NOT A SET OF HORN RULES. Every bullet under the guide's
+# "Excluded Transactions" heading removes the chargeback right entirely --
+# the dispute is not one the merchant may be charged back for, whatever the
+# evidence says. That is categorically different from a merchant-favouring
+# rule, which is a finding ON the evidence. Modelling a SafeKey-authenticated
+# transaction as `merchant_wins` would have the system claim to have weighed
+# a case it never needed to open, and would tell a card member they lost on
+# the facts when in fact the network gave them no chargeback right here at
+# all. `arbiter.eligibility` evaluates this block BEFORE the referee, and
+# when it fires the referee does not run.
+#
+# Note the deliberate overlap with F29_R_3DS below, which stays: SafeKey
+# Fraud Liability Shift is a program qualification (the exclusion), while
+# `three_ds_authenticated` is an observed authentication result. A
+# transaction can carry the second without qualifying for the first -- a
+# 3DS-authenticated transaction outside the program is judged on the merits
+# by F29_R_3DS, exactly as before. What changed is that a transaction which
+# DOES qualify never reaches it.
+chargeback_right:
+  network_code: "4540"
+  source: >
+    American Express, "Chargeback Codes -- What they mean" (Australian
+    merchant chargeback reason codes), Reason Code 4540 Card Not Present,
+    pp.17-20; Definitions pp.33-34.
+  # "Maximum time to challenge a dispute: Twenty (20) days from the date of
+  # Chargeback." This is the same 20 days arbiter.decision.deadlines already
+  # enforces as MERCHANT_RESPONSE_DAYS; declared here so the number lives
+  # with the reason code that specifies it rather than only as a constant.
+  merchant_challenge_days: 20
+
+  filing_window:
+    - branch_id: F29_WINDOW_PROCESSED
+      days: 120
+      from: transaction_processed_at
+      description: >
+        "Maximum time a dispute can be raised: One hundred and twenty (120)
+        days from the date American Express Network processed the
+        Transaction." Note this is the NETWORK chargeback clock, not the
+        card member's Reg Z billing-error clock -- see
+        arbiter.eligibility.models.ChargebackRight on why the two must not
+        be conflated.
+
+  exclusions:
+    - id: F29_EX_CARD_PRESENT
+      description: "Card Present Transactions."
+      legal_basis: "Amex AU chargeback guide, RC 4540 Excluded Transactions, bullet 1."
+      when:
+        - attribute: card_present
+          is: true
+
+    - id: F29_EX_PCSC_NOT_VALIDATED
+      description: >
+        The Printed Card Security Code was provided to the Issuer during the
+        Authorisation Request and the Issuer failed to provide a validation
+        of Yes or No in the Authorisation Response.
+      legal_basis: "Amex AU chargeback guide, RC 4540 Excluded Transactions, bullet 2."
+      # Both clauses are required, and the second is an ISSUER failure, not a
+      # mismatch: a returned "No" is a validation. This is the merchant being
+      # protected from the issuer's own gap, which is why it excludes rather
+      # than merely weakening the card member's case.
+      when:
+        - attribute: pcsc_provided
+          is: true
+        - attribute: pcsc_validation_returned
+          is: false
+
+    - id: F29_EX_AVS_VERIFIED_SHIPMENT
+      description: >
+        The Card Member address information was provided to the Issuer during
+        the Authorisation Request, the Issuer verified it through Automated
+        Address Verification and responded that the address matched, and the
+        Merchant shipped physical goods to that address.
+      legal_basis: "Amex AU chargeback guide, RC 4540 Excluded Transactions, bullet 3."
+      when:
+        - attribute: avs_address_verified_match
+          is: true
+        - attribute: physical_goods_shipped_to_verified_address
+          is: true
+
+    - id: F29_EX_SAFEKEY
+      description: "Transactions that qualify for American Express SafeKey Fraud Liability Shift."
+      legal_basis: "Amex AU chargeback guide, RC 4540 Excluded Transactions, bullet 4."
+      when:
+        - attribute: safekey_authenticated
+          is: true
+
+    - id: F29_EX_DIGITAL_WALLET_CONTACTLESS
+      description: >
+        Digital Wallet Contactless-initiated Transactions, Digital Wallet MST
+        Transactions and Contactless.
+      legal_basis: "Amex AU chargeback guide, RC 4540 Excluded Transactions, bullet 5."
+      # The guide lists these as one bullet naming three channels, i.e. an OR.
+      # Conditions within one exclusion are ANDed, so each channel is its own
+      # exclusion -- splitting is what preserves the guide's meaning, and each
+      # keeps the same citation.
+      when:
+        - attribute: digital_wallet_contactless_initiated
+          is: true
+
+    - id: F29_EX_DIGITAL_WALLET_MST
+      description: "Digital Wallet MST Transactions."
+      legal_basis: "Amex AU chargeback guide, RC 4540 Excluded Transactions, bullet 5."
+      when:
+        - attribute: digital_wallet_mst
+          is: true
+
+    - id: F29_EX_CONTACTLESS
+      description: "Contactless Transactions."
+      legal_basis: "Amex AU chargeback guide, RC 4540 Excluded Transactions, bullet 5."
+      when:
+        - attribute: contactless
+          is: true
 
 predicate_schema:
   - prior_undisputed_txn_count_ge_2
@@ -38,54 +165,131 @@ decision_predicates:
   MERCHANT_WINS: merchant_wins
   CARD_MEMBER_WINS: card_member_wins
 
+# Provenance-tier gate per predicate (C2), enforced at derivation
+# (arbiter.evidence.derive), never re-checked ad hoc downstream. This is
+# the disclosure-safety property the counterfactual ledger depends on: F29
+# has no document-extraction path at all (§ header note above), so every
+# merchant-favoring predicate here is either a real network/issuer signal
+# (NETWORK) or an ADEC-committed artifact (COMMITTED) -- a merchant who
+# reads their counterfactual and "fabricates" exactly what it names cannot
+# satisfy it by merely asserting it, because nothing at SUBMITTED/ASSERTED
+# tier can meet a NETWORK/COMMITTED gate. See
+# evals/gaming_resistance.py, which measures this property directly rather
+# than assuming it holds.
+predicates:
+  - id: device_id_match
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: ip_address_match
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: shipping_address_match
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: user_id_match
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: prior_undisputed_txn_count_ge_2
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: prior_txn_120_to_365_days_old
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: avs_match
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: cvv_match
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: three_ds_authenticated
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: adec_prior_txn_commitments_verified
+    party: MERCHANT
+    min_tier: COMMITTED
+  # Raised ASSERTED -> NETWORK, on both correctness and safety grounds.
+  #
+  # Correctness: Reg Z 12 CFR 1026.12(b) turns on NOTICE TO THE ISSUER, not
+  # on the cardholder's say-so. Amex records the date it received a
+  # lost/stolen report -- that record is the legally operative fact, and it
+  # is Amex-held network data, not an unverifiable narrative claim.
+  #
+  # Safety: F29_R_LOST_STOLEN decides the case on this predicate ALONE and
+  # constrains nothing else, so at ASSERTED tier a card member could win
+  # outright by asserting it. That is the mirror image of the C08_R4 defect
+  # (see C08's predicates block) with the parties reversed, and the fairness
+  # claim in this design is symmetry -- a gaming vector is no more
+  # acceptable pointing one way than the other.
+  - id: cardholder_reported_card_lost_stolen
+    party: CARD_MEMBER
+    min_tier: NETWORK
+  - id: account_takeover_signal
+    party: CARD_MEMBER
+    min_tier: NETWORK
+  - id: velocity_anomaly_flagged
+    party: CARD_MEMBER
+    min_tier: NETWORK
+
 rules:
   # -- CE3.0-faithful family: any qualifying pair, one of which must be
   # device_id or ip_address, over two prior undisputed transactions aged
   # 120-365 days.
-  - rule_id: F29_CE3_device_ip
+  #
+  # Authored with `at_least` (threshold / "N of M") rather than as five
+  # hand-written pairs. The loader expands each group into ordinary
+  # conjunctive Horn clauses at load time -- `F29_CE3_DEVICE_ANCHOR#1..#3`
+  # and `F29_CE3_IP_ANCHOR#1..#2` -- so the engine, prime-implicant
+  # enumeration and the counterfactual ledger see exactly the same five
+  # bodies they saw before, and tests/property/test_rulepacks.py::
+  # test_ce3_threshold_expansion_matches_hand_written_pairs pins that
+  # equivalence against the literal pairs this replaced.
+  #
+  # Worth doing because the Amex guide writes compelling evidence this way
+  # throughout -- RC 4540 asks for "three (3) or more of the following" and
+  # "at least two (2) of the following" (pp.19-20) -- and hand-expanding an
+  # N-of-M requirement is where a rulepack author silently drops a
+  # combination. The threshold form cannot drop one.
+  #
+  # Rule ids changed shape here (version 1.0.0 -> 1.1.0). Historical
+  # `rule_firing` rows keep the old ids; the fairness layer's per-rule
+  # disparate-impact analysis therefore treats pre- and post-1.1.0 firings
+  # as different rules, which is the honest reading -- they were authored
+  # differently even though they decide identically.
+  - rule_id: F29_CE3_DEVICE_ANCHOR
     head: merchant_wins
-    description: "CE3.0: device_id + ip_address match on 2+ prior undisputed transactions (120-365d)."
+    description: >
+      CE3.0: device_id match plus at least one further matching identifier
+      (ip_address, shipping_address or user_id) on 2+ prior undisputed
+      transactions aged 120-365 days.
+    legal_basis: "Visa Compelling Evidence 3.0 (Visa Core Rules, dispute reason code 10.4); Reg Z 12 CFR 1026.12(b) cardholder liability for unauthorized use."
     body:
       - prior_undisputed_txn_count_ge_2
       - prior_txn_120_to_365_days_old
       - device_id_match
-      - ip_address_match
+      - at_least:
+          n: 1
+          of:
+            - ip_address_match
+            - shipping_address_match
+            - user_id_match
 
-  - rule_id: F29_CE3_device_shipping
+  - rule_id: F29_CE3_IP_ANCHOR
     head: merchant_wins
-    description: "CE3.0: device_id + shipping_address match on 2+ prior undisputed transactions (120-365d)."
-    body:
-      - prior_undisputed_txn_count_ge_2
-      - prior_txn_120_to_365_days_old
-      - device_id_match
-      - shipping_address_match
-
-  - rule_id: F29_CE3_device_user
-    head: merchant_wins
-    description: "CE3.0: device_id + user_id match on 2+ prior undisputed transactions (120-365d)."
-    body:
-      - prior_undisputed_txn_count_ge_2
-      - prior_txn_120_to_365_days_old
-      - device_id_match
-      - user_id_match
-
-  - rule_id: F29_CE3_ip_shipping
-    head: merchant_wins
-    description: "CE3.0: ip_address + shipping_address match on 2+ prior undisputed transactions (120-365d)."
+    description: >
+      CE3.0: ip_address match plus at least one of shipping_address or
+      user_id on 2+ prior undisputed transactions aged 120-365 days. The
+      device_id+ip_address pair is covered by F29_CE3_DEVICE_ANCHOR, so it
+      is deliberately not repeated here.
+    legal_basis: "Visa Compelling Evidence 3.0 (Visa Core Rules, dispute reason code 10.4); Reg Z 12 CFR 1026.12(b) cardholder liability for unauthorized use."
     body:
       - prior_undisputed_txn_count_ge_2
       - prior_txn_120_to_365_days_old
       - ip_address_match
-      - shipping_address_match
-
-  - rule_id: F29_CE3_ip_user
-    head: merchant_wins
-    description: "CE3.0: ip_address + user_id match on 2+ prior undisputed transactions (120-365d)."
-    body:
-      - prior_undisputed_txn_count_ge_2
-      - prior_txn_120_to_365_days_old
-      - ip_address_match
-      - user_id_match
+      - at_least:
+          n: 1
+          of:
+            - shipping_address_match
+            - user_id_match
 
   # -- ARBITER's generalisation: ADEC-verified prior-transaction commitments
   # remove the 120-365-day floor, because non-backdating is proven directly.
@@ -97,6 +301,7 @@ rules:
       ADEC proves non-backdating without leaning on a 120-day floor as a
       proxy for it. This is CE3.0 generalised from transactions to
       arbitrary evidence artifacts (§1.5).
+    legal_basis: "Not a codified regulatory or network rule -- ARBITER's own evidentiary generalization of Visa CE3.0 (see rulepacks/README.md §1.5), still grounded in Reg Z 12 CFR 1026.12(b) cardholder liability for unauthorized use."
     body:
       - adec_prior_txn_commitments_verified
       - device_id_match
@@ -106,6 +311,7 @@ rules:
   - rule_id: F29_R_3DS
     head: merchant_wins
     description: Transaction was 3-D Secure authenticated with AVS and CVV match.
+    legal_basis: "3-D Secure / Amex SafeKey liability-shift program rules for authenticated CNP transactions; Reg Z 12 CFR 1026.12(b) liability for unauthorized use does not attach where the cardholder authenticated the transaction."
     body:
       - three_ds_authenticated
       - avs_match
@@ -115,6 +321,7 @@ rules:
   - rule_id: F29_R_LOST_STOLEN
     head: card_member_wins
     description: Card member reported the card lost or stolen prior to the transaction.
+    legal_basis: "Reg Z 12 CFR 1026.12(b) -- cardholder liability for unauthorized use ends upon notice to the issuer that the card was lost or stolen."
     body:
       - cardholder_reported_card_lost_stolen
 
@@ -123,6 +330,7 @@ rules:
     description: >
       Account-takeover signal present (device/session discontinuity) with
       no 3-D Secure authentication to shift liability.
+    legal_basis: "Reg Z 12 CFR 1026.12(b) -- an account-takeover transaction is unauthorized by definition; the cardholder did not conduct or authorize it."
     body:
       - account_takeover_signal
       - not three_ds_authenticated
@@ -132,6 +340,7 @@ rules:
     description: >
       Velocity anomaly flagged and neither device nor IP matches any prior
       transaction -- consistent with a new, unfamiliar actor.
+    legal_basis: "Not a codified regulatory citation -- an evidentiary corroboration rule supporting a Reg Z 12 CFR 1026.12(b) unauthorized-use finding, not a rule the regulation itself specifies."
     body:
       - velocity_anomaly_flagged
       - not device_id_match

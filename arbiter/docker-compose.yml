@@ -46,6 +46,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      # `runtime` bakes in torch + a DeBERTa-NLI checkpoint so the MANDATORY
+      # semantic contradiction layer actually runs. `runtime-slim` omits
+      # them, and that layer then reports UNAVAILABLE and escalates every
+      # case with comparable claim pairs -- correct fail-closed behaviour,
+      # but a permanently degraded mode.
+      target: runtime
+      args:
+        NLI_VARIANT: base
     environment:
       ARBITER_DATABASE_URL: postgresql+psycopg://arbiter:arbiter@db:5432/arbiter
       ARBITER_REDIS_URL: redis://redis:6379/0
@@ -53,6 +61,35 @@ services:
       ARBITER_MINIO_ACCESS_KEY: arbiter
       ARBITER_MINIO_SECRET_KEY: arbiter123
       ARBITER_OLLAMA_BASE_URL: http://host.docker.internal:11434
+
+      # This compose file describes a LOCAL DEVELOPMENT stack, and says so
+      # explicitly rather than leaving it implied. Previously it set no
+      # secrets at all, so the documented "full stack" ran with the built-in
+      # default HMAC key -- every bearer token forgeable by anyone who had
+      # read the source -- and an ephemeral audit signing key that
+      # invalidated every signature on restart. Neither failed loudly,
+      # because nothing checked.
+      #
+      # `env: dev` keeps arbiter.config.validate_for_environment permissive.
+      # Setting ARBITER_ENV to anything else makes the API REFUSE TO START
+      # unless real secrets are supplied, which is the point: a deployment
+      # cannot silently inherit these values.
+      ARBITER_ENV: dev
+      ARBITER_ENABLE_DEV_AUTH: "true"   # POST /v1/auth/dev-token -- development only
+
+      # Development-only key material. Fixed rather than random so a restart
+      # does not invalidate the audit chain or the transparency log across
+      # `docker compose up` cycles. REPLACE ALL OF THESE, from a real secret
+      # store, for anything that is not a laptop.
+      ARBITER_AUTH_SECRET: dev-only-compose-secret-not-for-any-real-deployment
+      ARBITER_SIGNING_KEY_SEED: "1111111111111111111111111111111111111111111111111111111111111111"
+      ARBITER_LOG_OPERATOR_KEY_SEED: "2222222222222222222222222222222222222222222222222222222222222222"
+      ARBITER_TSA_KEY_SEED: "3333333333333333333333333333333333333333333333333333333333333333"
+      # Fernet KEK wrapping per-subject crypto-shredding keys. Without it
+      # subject keys are not persisted and every encrypted PII field becomes
+      # unrecoverable on restart.
+      ARBITER_KEY_ENCRYPTION_KEY: "ZGV2LW9ubHkta2V5LWVuY3J5cHRpb24ta2V5LTMyYnk="
+      ARBITER_PAN_TOKENIZATION_KEY: "dev-only-pan-tokenization-key-not-for-production"
     ports:
       - "8000:8000"
     depends_on:
@@ -62,15 +99,63 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    # Migrations run here only because local compose has exactly one
+    # replica. In a real rollout this is a pre-deploy job -- every replica
+    # racing to migrate is how a deploy corrupts a schema.
     command: >
       sh -c "alembic upgrade head && uvicorn arbiter.main:app --host 0.0.0.0 --port 8000"
 
+  # Adjudication runs OUT of the request path. The API enqueues a job and
+  # returns 202; these workers drain the queue. `SELECT ... FOR UPDATE SKIP
+  # LOCKED` makes running several safe -- they take disjoint jobs rather
+  # than blocking on or duplicating each other's.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+      args:
+        NLI_VARIANT: base
+    environment: &worker_env
+      ARBITER_DATABASE_URL: postgresql+psycopg://arbiter:arbiter@db:5432/arbiter
+      ARBITER_REDIS_URL: redis://redis:6379/0
+      ARBITER_OLLAMA_BASE_URL: http://host.docker.internal:11434
+      ARBITER_ENV: dev
+      ARBITER_AUTH_SECRET: dev-only-compose-secret-not-for-any-real-deployment
+      ARBITER_SIGNING_KEY_SEED: "1111111111111111111111111111111111111111111111111111111111111111"
+      ARBITER_LOG_OPERATOR_KEY_SEED: "2222222222222222222222222222222222222222222222222222222222222222"
+      ARBITER_TSA_KEY_SEED: "3333333333333333333333333333333333333333333333333333333333333333"
+      ARBITER_KEY_ENCRYPTION_KEY: "ZGV2LW9ubHkta2V5LWVuY3J5cHRpb24ta2V5LTMyYnk="
+      ARBITER_PAN_TOKENIZATION_KEY: "dev-only-pan-tokenization-key-not-for-production"
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+    command: ["python", "scripts/run_adjudication_worker.py", "--poll", "2"]
+
+  # The regulatory clock. A separate process on purpose: a clock that stops
+  # when the last web request finishes is not a clock -- Reg Z and Reg E
+  # deadlines accrue whether or not anyone is browsing.
+  clock:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime-slim
+    environment: *worker_env
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+    command: ["python", "scripts/run_deadline_sweeper.py", "--loop", "60"]
+
   web:
+    # Static React SPA served by nginx. No Node runtime in the final image
+    # -- there is no server to run, so there is no server to attack.
     build:
       context: ./web
       dockerfile: Dockerfile
-    environment:
-      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+      args:
+        VITE_API_BASE_URL: http://localhost:8000
     ports:
       - "3000:3000"
     depends_on:

@@ -10,8 +10,8 @@ crash: an ImportError here is a routing signal, not a fatal error.
 
 from __future__ import annotations
 
-from .schemas import ExtractedField, ExtractionResult, SourceRef
 from .extract_native import classify_document_type
+from .schemas import ExtractedField, ExtractionResult, SourceRef
 
 _ocr_engine = None
 
@@ -38,9 +38,10 @@ def extract_ocr(artifact_id: str, image_bytes: bytes, page: int = 0) -> Extracti
     if not is_available():
         return None
 
+    import io
+
     import numpy as np
     from PIL import Image
-    import io
 
     engine = _get_engine()
     img = Image.open(io.BytesIO(image_bytes)).convert("RGB")

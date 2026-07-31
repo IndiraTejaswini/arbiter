@@ -13,14 +13,93 @@ record.
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
 from .contradiction import SEVERITY_RANK, Contradiction
 from .identity import IdentityAssertion, detect_identity_incoherence
 from .models import EdgeType, EvidenceEdge, EvidenceNode, EvidenceNodeType, ProvenanceTier
 from .numeric import MoneyAmount, reconcile_chain
-from .semantic import SemanticClaim, detect_semantic_contradictions
+from .semantic import SemanticClaim, analyze_semantic_claims
 from .temporal import TemporalFact, TimeInterval, detect_temporal_contradictions
+
+# The four mandatory layers, in pipeline order. Named here so the set is
+# closed and greppable rather than implied by the body of one function.
+MANDATORY_LAYERS: Tuple[str, ...] = ("temporal", "numeric", "identity", "semantic")
+
+
+def _as_datetime(value: Any) -> Optional[datetime]:
+    """Accept a timestamp as either a datetime or its ISO-8601 form.
+
+    Defence in depth at the layer that matters. `evidence_node.attrs` is a
+    JSONB column, so a node re-read from Postgres carries `temporal_value`
+    as a string even though the network loader produced a datetime. Handing
+    that string to `TimeInterval` would compare TEXT where Allen interval
+    algebra means to compare instants -- and lexicographic comparison of
+    mixed-offset ISO strings is wrong without ever raising, which is the
+    worst available failure mode for a check that is supposed to be
+    mandatory.
+
+    `arbiter.api.orchestration` re-hydrates these on read, so in the normal
+    path this is a no-op. It is here as well because a silently-degraded
+    contradiction layer is precisely the defect this system is built to make
+    impossible, and one boundary enforcing that is one boundary somebody can
+    forget to route a new caller through.
+    """
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+@dataclass(frozen=True)
+class ContradictionAnalysis:
+    """Result of the four-layer mandatory pipeline, with per-layer status.
+
+    The status matters as much as the findings: an empty contradiction list
+    is ambiguous between "this case is clean" and "a mandatory check could
+    not run", and collapsing those two is how the semantic layer sat dead
+    for an entire build while reporting success.
+    """
+
+    contradictions: List[Contradiction] = field(default_factory=list)
+    layer_status: Dict[str, str] = field(default_factory=dict)
+    unavailable_layers: Tuple[str, ...] = ()
+    unavailable_reason: Optional[str] = None
+    semantic_pairs_evaluated: int = 0
+
+    @property
+    def complete(self) -> bool:
+        """True when every mandatory layer either ran or had nothing
+        applicable to examine."""
+        return not self.unavailable_layers
+
+    @property
+    def must_escalate(self) -> bool:
+        """A mandatory check that could not run is an unknown, and an
+        unknown blocks auto-resolution exactly like an unresolved HIGH
+        contradiction does."""
+        return bool(self.unavailable_layers)
+
+    def to_dict(self) -> dict:
+        return {
+            "complete": self.complete,
+            "must_escalate": self.must_escalate,
+            "layer_status": dict(self.layer_status),
+            "unavailable_layers": list(self.unavailable_layers),
+            "unavailable_reason": self.unavailable_reason,
+            "semantic_pairs_evaluated": self.semantic_pairs_evaluated,
+            "contradictions": [
+                {"kind": c.kind, "severity": c.severity, "layer": c.layer,
+                 "description": c.description, "node_ids": list(c.node_ids)}
+                for c in self.contradictions
+            ],
+        }
 
 
 class EvidenceGraph:
@@ -30,6 +109,7 @@ class EvidenceGraph:
         self.edges: List[EvidenceEdge] = []
         self.contradictions: List[Contradiction] = []
         self.contradiction_nodes: List[EvidenceNode] = []
+        self.last_analysis: Optional[ContradictionAnalysis] = None
 
     # -- graph construction ------------------------------------------------
 
@@ -56,7 +136,7 @@ class EvidenceGraph:
         out = []
         for n in self.nodes.values():
             fact_key = n.attrs.get("temporal_fact_key")
-            ts = n.attrs.get("temporal_value")
+            ts = _as_datetime(n.attrs.get("temporal_value"))
             if fact_key and ts is not None:
                 out.append(
                     TemporalFact(
@@ -96,15 +176,23 @@ class EvidenceGraph:
         return out
 
     def _extract_semantic_claims(self) -> List[SemanticClaim]:
+        """Claims the NLI layer can compare.
+
+        Gated on `claim_text` rather than on `claim_polarity`: the engine is
+        a text cross-encoder, so a claim with no text is not something it
+        can classify. The old gate required a boolean polarity flag -- which
+        was both the heuristic the layer no longer uses and an attribute
+        nothing in the system ever populated.
+        """
         out = []
         for n in self.nodes.values():
             subject = n.attrs.get("claim_subject")
-            polarity = n.attrs.get("claim_polarity")
-            if subject is not None and polarity is not None:
+            text = n.attrs.get("claim_text")
+            if subject is not None and text:
                 out.append(
                     SemanticClaim(
-                        subject_key=subject, polarity=bool(polarity), node_id=n.node_id,
-                        source_text=n.attrs.get("claim_text", ""),
+                        subject_key=str(subject), node_id=n.node_id, source_text=str(text),
+                        polarity=n.attrs.get("claim_polarity"),
                     )
                 )
         return out
@@ -112,11 +200,45 @@ class EvidenceGraph:
     # -- orchestration -------------------------------------------------------
 
     def run_contradiction_analysis(self) -> List[Contradiction]:
+        """Run all four MANDATORY layers. Returns findings only; call
+        `analyze_contradictions` when you need the per-layer status too
+        (the adjudication pipeline does -- see ContradictionAnalysis)."""
+        return self.analyze_contradictions().contradictions
+
+    def analyze_contradictions(self) -> "ContradictionAnalysis":
+        """The four-layer deterministic contradiction pipeline (A6).
+
+        ALL FOUR LAYERS ARE MANDATORY. None is optional, none is
+        conditional on configuration, and none may be skipped:
+
+            1. Temporal  -- Allen interval algebra + domain ordering
+            2. Numeric   -- order -> authorization -> settlement -> refund
+            3. Identity  -- address / device / IP / email coherence
+            4. Semantic  -- DeBERTa-v3-MNLI cross-encoder, exclusively
+
+        No layer uses a generative model. The semantic layer's engine is
+        DeBERTa-NLI and nothing else (see arbiter.evidence.nli for why an
+        LLM at this boundary would be the one unguarded LLM in the system).
+
+        A layer that CANNOT RUN is not a layer that found nothing. The
+        returned analysis carries per-layer status, and
+        `must_escalate` is True when a mandatory layer was unable to
+        examine evidence it should have -- which blocks auto-resolution the
+        same way an unresolved HIGH contradiction does. Previously the
+        semantic layer ran on every case, found nothing on every case
+        (because nothing populated its inputs), and was indistinguishable
+        from being switched off.
+        """
         found: List[Contradiction] = []
+        layer_status: Dict[str, str] = {}
 
-        for c in detect_temporal_contradictions(self._extract_temporal_facts()):
+        # -- Layer 1: temporal (Allen interval algebra) -------------------
+        temporal_facts = self._extract_temporal_facts()
+        for c in detect_temporal_contradictions(temporal_facts):
             found.append(Contradiction(c.kind, c.severity, c.description, c.node_ids, "temporal"))
+        layer_status["temporal"] = "OK" if temporal_facts else "NOT_APPLICABLE"
 
+        # -- Layer 2: numeric reconciliation ------------------------------
         money = self._extract_money_amounts()
         for c in reconcile_chain(
             order_total=money.get("order_total"),
@@ -125,16 +247,32 @@ class EvidenceGraph:
             refund=money.get("refund"),
         ):
             found.append(Contradiction(c.kind, c.severity, c.description, c.node_ids, "numeric"))
+        layer_status["numeric"] = "OK" if money else "NOT_APPLICABLE"
 
-        for c in detect_identity_incoherence(self._extract_identity_assertions()):
+        # -- Layer 3: identity coherence ----------------------------------
+        identity_assertions = self._extract_identity_assertions()
+        for c in detect_identity_incoherence(identity_assertions):
             found.append(Contradiction(c.kind, c.severity, c.description, c.node_ids, "identity"))
+        layer_status["identity"] = "OK" if identity_assertions else "NOT_APPLICABLE"
 
-        for c in detect_semantic_contradictions(self._extract_semantic_claims()):
+        # -- Layer 4: semantic (DeBERTa-NLI ONLY) -------------------------
+        semantic = analyze_semantic_claims(self._extract_semantic_claims())
+        for c in semantic.contradictions:
             found.append(Contradiction(c.kind, c.severity, c.description, c.node_ids, "semantic"))
+        layer_status["semantic"] = semantic.status.value
 
         self.contradictions = found
         self._materialize_contradiction_nodes(found)
-        return found
+
+        analysis = ContradictionAnalysis(
+            contradictions=found,
+            layer_status=layer_status,
+            unavailable_layers=(("semantic",) if semantic.must_escalate else ()),
+            unavailable_reason=semantic.unavailable_reason,
+            semantic_pairs_evaluated=semantic.pairs_evaluated,
+        )
+        self.last_analysis = analysis
+        return analysis
 
     def _materialize_contradiction_nodes(self, contradictions: List[Contradiction]) -> None:
         """A6: contradictions become first-class graph nodes with severity,

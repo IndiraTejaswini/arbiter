@@ -10,7 +10,7 @@ only insofar as it feeds adjudication of a dispute already filed).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 
 @dataclass(frozen=True)

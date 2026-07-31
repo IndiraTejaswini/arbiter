@@ -36,8 +36,9 @@ from typing import Dict, List, Tuple
 
 from arbiter.horn.clause import RulePack
 from arbiter.horn.proof import Fact
-
 from arbiter.llm.client import complete_json, is_available
+from arbiter.privacy.redact import redact_text
+
 from .contract import ArgumentGraph, ArgumentTriple
 from .verify import TripleVerification, verify_assertions
 
@@ -88,7 +89,16 @@ def _evidence_summary(graph, node_ids: List[str], max_nodes: int = 40) -> str:
         extracted = node.attrs.get("extracted_fields")
         field_str = ""
         if extracted:
-            field_str = "; ".join(f"{f['field_name']}={f['value']!r}" for f in extracted[:6])
+            # PII redaction at the LLM-prompt boundary (arbiter.privacy.
+            # redact): a raw extracted field can carry a card number,
+            # SSN, email, or phone number that has no bearing on which
+            # rulepack predicate it supports -- redacted here, before any
+            # of it enters a prompt, never at the point of extraction
+            # (arbiter.ingest still needs the real value for numeric
+            # reconciliation and predicate tagging).
+            field_str = "; ".join(
+                f"{f['field_name']}={redact_text(str(f['value']))[0]!r}" for f in extracted[:6]
+            )
         else:
             asserted = node.attrs.get("asserts_predicate")
             if asserted:

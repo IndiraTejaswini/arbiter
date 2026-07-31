@@ -8,7 +8,96 @@
 
 rulepack_id: amex-C08-v1
 reason_code: C08
-version: "1.0.0"
+version: "1.1.0"
+
+# Party-facing catalogue metadata. `title` is the guide's own name for this
+# code; `description` is one sentence from the card member's point of view,
+# because the console's "file a dispute" screen asks them to pick what
+# happened to them, not to know a reason code. Both are prose ABOUT the
+# rules and neither enters content_hash() -- editing them does not mint a
+# new rulepack version or invalidate a pinned decision.
+title: Goods or services not received
+description: You paid for something and never received it.
+
+# -- The chargeback right itself (arbiter.eligibility) --------------------
+#
+# American Express, "Chargeback Codes -- What they mean" (Australian
+# merchant reason codes), Reason Code 4554 "Goods And Services Not
+# Received", pp.23-24.
+#
+# C08's filing window is the most structurally interesting one in the whole
+# guide, and the reason the window model here is a list of branches rather
+# than a single number:
+#
+#   "One hundred and twenty (120) days from the date American Express
+#    Network processed the Transaction, or one hundred and twenty (120)
+#    days from (whichever occurred first): the date the Card Member expected
+#    to receive goods and/or services, or the date the Card Member became
+#    aware that the expected goods and/or services would not be provided
+#    (not exceeding five hundred and forty (540) days from the date American
+#    Express Network processed the Transaction)."
+#
+# Three things have to be right at once, and each is a way a naive
+# implementation goes wrong:
+#
+#   1. The two clauses are alternatives (OR) -- a dispute filed 200 days
+#      after processing is still in time if the goods were only due 30 days
+#      ago. A single 120-day-from-processing check silently kills every
+#      pre-order, backorder and long-lead-time delivery dispute.
+#   2. WITHIN the second clause, "whichever occurred first" means the
+#      EARLIER of the two dates starts the clock -- not the later, and not
+#      either at the card member's choice. Modelling those as two
+#      independent branches would be materially more permissive than the
+#      guide. `FilingWindowBranch.from_attributes` takes both names for
+#      exactly this construction.
+#   3. The 540-day cap is an absolute backstop on the awareness clock,
+#      measured from PROCESSING, not from the anchor. Without it the second
+#      clause is unbounded: a card member who becomes "aware" three years
+#      later would be filing inside a window that opened three years after
+#      the charge.
+chargeback_right:
+  network_code: "4554"
+  source: >
+    American Express, "Chargeback Codes -- What they mean" (Australian
+    merchant chargeback reason codes), Reason Code 4554 Goods And Services
+    Not Received, pp.23-24.
+  merchant_challenge_days: 20
+
+  filing_window:
+    - branch_id: C08_WINDOW_PROCESSED
+      days: 120
+      from: transaction_processed_at
+      description: "120 days from the date the American Express Network processed the Transaction."
+
+    - branch_id: C08_WINDOW_EXPECTED_OR_AWARE
+      days: 120
+      from:
+        - expected_delivery_at
+        - became_aware_at
+      absolute_cap_days: 540
+      cap_from: transaction_processed_at
+      description: >
+        120 days from whichever occurred FIRST of the expected-receipt date
+        and the date the card member became aware the goods/services would
+        not be provided, capped at 540 days from the processing date.
+
+  exclusions:
+    - id: C08_EX_CHARGEABLE_UNDER_4513
+      description: >
+        Transactions that could be charged back under Reason Code 4513 --
+        Credit Not Presented.
+      legal_basis: "Amex AU chargeback guide, RC 4554 Excluded Transactions."
+      # Cross-code precedence, and the reason `qualifies_under_reason_codes`
+      # exists in the attribute vocabulary at all. The guide uses this
+      # construction in both directions (4536 likewise excludes transactions
+      # chargeable under 4521), and its purpose is to stop a dispute being
+      # routed to whichever code happens to be easier to win under. ARBITER
+      # can enforce it precisely because triage is explicit here: the intent
+      # classifier's chosen bucket is recorded, so "this is really a 4513"
+      # is a checkable claim rather than an argument between two parties.
+      when:
+        - attribute: qualifies_under_reason_codes
+          one_of: ["4513", "C02"]
 
 predicate_schema:
   - delivery_confirmed
@@ -28,12 +117,92 @@ decision_predicates:
   MERCHANT_WINS: merchant_wins
   CARD_MEMBER_WINS: card_member_wins
 
+# Provenance-tier gate per predicate (C2). Unlike F29, C08 genuinely mixes
+# tiers on purpose: `delivery_confirmed` and `signature_missing` are
+# document-extraction predicates (arbiter.ingest._PREDICATE_HINTS maps
+# straight to an uploaded artifact's extracted fields) and are
+# intentionally left at SUBMITTED -- because the rule design is what gates
+# them: C08_R1 requires delivery_confirmed AND address_matches_avs AND not
+# signature_missing TOGETHER, never delivery_confirmed alone, and
+# address_matches_avs is NETWORK-gated. A fabricated delivery document
+# therefore cannot win on its own.
+#
+# The rule that governs whether a SUBMITTED tier is acceptable is simple
+# and worth stating as a rulepack-authoring invariant:
+#
+#   A predicate may sit at SUBMITTED only if EVERY rule that uses it also
+#   requires at least one NETWORK- or COMMITTED-tier predicate.
+#
+# `cardholder_confirmed_receipt` violated that invariant (C08_R4 fires on
+# it alone) and has been raised to NETWORK accordingly -- see its entry
+# below. Checked mechanically by
+# tests/property/test_rulepacks.py::test_no_submitted_tier_predicate_wins_alone.
+# `digital_goods_access_logged`, `tracking_shows_delivered`,
+# `merchant_shipped_before_dispute`, `refund_already_issued`,
+# `delivery_address_mismatch`, and `carrier_exception_reported` ARE
+# tier-gated at NETWORK, specifically because each backs a rule (C08_R2
+# fires on digital_goods_access_logged ALONE) where a bare self-submitted
+# claim would otherwise be sufficient to win outright -- see
+# evals/gaming_resistance.py's C08 case for exactly this scenario.
+predicates:
+  - id: delivery_confirmed
+    party: MERCHANT
+    min_tier: SUBMITTED
+  - id: address_matches_avs
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: signature_missing
+    party: CARD_MEMBER
+    min_tier: SUBMITTED
+  - id: tracking_shows_delivered
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: digital_goods_access_logged
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: merchant_shipped_before_dispute
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: cancellation_requested_before_shipment
+    party: CARD_MEMBER
+    min_tier: SUBMITTED
+  - id: refund_already_issued
+    party: MERCHANT
+    min_tier: NETWORK
+  # Raised SUBMITTED -> NETWORK. C08_R4 fires on this predicate ALONE, so
+  # at SUBMITTED tier a merchant could win outright on a self-supplied
+  # document. `evals/gaming_resistance.py` measured that directly and
+  # reported the failure rather than hiding it: 95 of 99 fabricated cases
+  # flipped the verdict. The rulepack's own comment claimed forensics and
+  # contradiction detection were the defense there -- but neither is a
+  # substitute for tier gating on a single-predicate decisive rule, and a
+  # forgery good enough to pass forensics wins the entire case unopposed.
+  #
+  # NETWORK is the honest tier for this fact in a CLOSED LOOP: Amex holds
+  # the card member's own communications on its own system of record (see
+  # README, "why this belongs at Amex specifically"), so a genuine
+  # acknowledgment of receipt IS network-side evidence. A four-party issuer
+  # could not make this claim and would have to conjoin the rule instead.
+  - id: cardholder_confirmed_receipt
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: adec_shipment_commitment_verified
+    party: MERCHANT
+    min_tier: COMMITTED
+  - id: delivery_address_mismatch
+    party: CARD_MEMBER
+    min_tier: NETWORK
+  - id: carrier_exception_reported
+    party: CARD_MEMBER
+    min_tier: NETWORK
+
 rules:
   - rule_id: C08_R1
     head: merchant_wins
     description: >
       Delivery confirmed to the AVS-verified address with no missing
       required signature. The canonical proof-of-delivery defense.
+    legal_basis: "Reg Z 12 CFR 1026.13(a)(3) -- no billing error where property/services were delivered as agreed; Amex/network merchant proof-of-delivery standard for 'Goods/Services Not Received' disputes."
     body:
       - delivery_confirmed
       - address_matches_avs
@@ -45,6 +214,7 @@ rules:
       Digital goods: server-side access/download logs show the card member
       used the purchased good after the order. Physical delivery proof does
       not apply to this category.
+    legal_basis: "Reg Z 12 CFR 1026.13(a)(3) -- no billing error where services were rendered as agreed, applied to digital-goods delivery via access/download logs in place of a physical proof-of-delivery."
     body:
       - digital_goods_access_logged
 
@@ -54,6 +224,7 @@ rules:
       ADEC-verified shipment commitment (pre-dispute, non-backdatable) plus
       carrier delivery confirmation, with no address mismatch. Higher-trust
       path: the shipment event was committed before the dispute could exist.
+    legal_basis: "Reg Z 12 CFR 1026.13(a)(3); ADEC-committed shipment evidence is ARBITER's own non-backdatable strengthening of the same proof-of-delivery standard C08_R1 encodes (see rulepacks/README.md)."
     body:
       - adec_shipment_commitment_verified
       - tracking_shows_delivered
@@ -62,6 +233,7 @@ rules:
   - rule_id: C08_R4
     head: merchant_wins
     description: The card member's own communications acknowledge receipt.
+    legal_basis: "Reg Z 12 CFR 1026.13(a)(3) -- no billing error where the cardholder's own acknowledgment establishes property/services were received."
     body:
       - cardholder_confirmed_receipt
 
@@ -71,6 +243,7 @@ rules:
       Nothing was ever confirmed delivered, the merchant did not ship before
       the dispute was filed, and the carrier logged an explicit delivery
       exception (lost, returned-to-sender, failed delivery attempt).
+    legal_basis: "Reg Z 12 CFR 1026.13(a)(3) -- property or services not accepted/delivered as agreed is a billing error; 12 CFR 1026.13(d) creditor resolution obligations."
     body:
       - not delivery_confirmed
       - not merchant_shipped_before_dispute
@@ -81,6 +254,7 @@ rules:
     description: >
       Card member cancelled before the merchant shipped, and no refund has
       been issued for the cancelled order.
+    legal_basis: "Reg Z 12 CFR 1026.13(a)(3) -- goods/services never delivered/rendered because the order was cancelled before shipment is a billing error absent a corresponding credit."
     body:
       - cancellation_requested_before_shipment
       - not refund_already_issued

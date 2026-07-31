@@ -132,6 +132,7 @@ class Engine:
                             holds=True,
                             literals=witnesses,
                             description=rule.description,
+                            legal_basis=rule.legal_basis,
                         )
                         delta_new = True
 

@@ -17,11 +17,11 @@ import struct
 import time
 from dataclasses import dataclass
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
-from cryptography.exceptions import InvalidSignature
 
 
 @dataclass(frozen=True)
@@ -39,16 +39,51 @@ class TimeStampToken:
             "signature": self.signature.hex(),
         }
 
+    # Canonical fixed-width serialisation for `merkle_batch.tsa_token`.
+    # `message_imprint` is deliberately NOT stored: it is always the batch's
+    # own root_hash, which the row already carries, so persisting it would
+    # be a second copy that could disagree with the first.
+    def to_bytes(self) -> bytes:
+        return self.tsa_key_id + struct.pack(">Q", self.gen_time_unix_ns) + self.signature
+
+    @classmethod
+    def from_bytes(cls, message_imprint: bytes, blob: bytes) -> "TimeStampToken":
+        if len(blob) < 16:
+            raise ValueError("tsa token blob too short")
+        return cls(
+            message_imprint=message_imprint,
+            tsa_key_id=blob[:8],
+            gen_time_unix_ns=struct.unpack(">Q", blob[8:16])[0],
+            signature=blob[16:],
+        )
+
 
 def _signed_bytes(message_imprint: bytes, gen_time_unix_ns: int) -> bytes:
     return message_imprint + struct.pack(">Q", gen_time_unix_ns)
 
 
+def _load_seeded_key(seed_hex: str | None) -> Ed25519PrivateKey:
+    if seed_hex:
+        return Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed_hex))
+    return Ed25519PrivateKey.generate()
+
+
 class TimeStampAuthority:
-    """A minimal TSA: signs H(data) || time with its own Ed25519 identity."""
+    """A minimal TSA: signs H(data) || time with its own Ed25519 identity.
+
+    Key persistence matters here for the same reason it does for
+    `arbiter.audit.sign.EventSigner`: an ephemeral key means every
+    timestamp token this process wrote becomes unverifiable the moment it
+    restarts, which silently voids the non-backdating proof that is the
+    entire point of ADEC. Seeded from `ARBITER_TSA_KEY_SEED` when set.
+    """
 
     def __init__(self, private_key: Ed25519PrivateKey | None = None):
-        self._key = private_key or Ed25519PrivateKey.generate()
+        if private_key is None:
+            from arbiter.config import get_settings
+
+            private_key = _load_seeded_key(get_settings().tsa_key_seed)
+        self._key = private_key
         pub = self._key.public_key().public_bytes_raw()
         self.key_id = pub[:8]
         self._public_key = self._key.public_key()

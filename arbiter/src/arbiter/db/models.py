@@ -17,20 +17,19 @@ from datetime import datetime
 from typing import Any, Optional
 
 from sqlalchemy import (
+    REAL,
     BigInteger,
     CheckConstraint,
+    DateTime,
     Enum,
     ForeignKey,
     Index,
     LargeBinary,
-    Numeric,
-    REAL,
     String,
     UniqueConstraint,
-    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSTZRANGE, UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import func
 
 
@@ -74,6 +73,16 @@ class OutcomeEnum(str, enum.Enum):
     MERCHANT_PREVAILS = "MERCHANT_PREVAILS"
     SPLIT = "SPLIT"
     INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+    # The network chargeback right did not exist for this dispute: the
+    # filing window had closed, or the transaction is one the reason code's
+    # "Excluded Transactions" list removes (arbiter.eligibility). NOT a
+    # merchant win -- no evidence was weighed. Kept distinct so that win
+    # rates, the fairness layer's per-rule disparate-impact analysis and the
+    # conformal calibration pool never count a case nobody adjudicated as
+    # one somebody won. The card member's Reg Z billing-error rights against
+    # the issuer are untouched by this outcome; see
+    # arbiter.eligibility.models.ChargebackRight.
+    CHARGEBACK_INELIGIBLE = "CHARGEBACK_INELIGIBLE"
 
 
 class ContradictionSeverityEnum(str, enum.Enum):
@@ -84,6 +93,15 @@ class ContradictionSeverityEnum(str, enum.Enum):
 
 
 class EvidenceNodeTypeEnum(str, enum.Enum):
+    # NOTE: this is the ONE enum in this module whose member names differ
+    # from its values -- the Postgres type is lowercase (migration 0001,
+    # matching `arbiter.evidence.models.EvidenceNodeType`), while the Python
+    # member names are upper. SQLAlchemy's `Enum` persists the member NAME by
+    # default, so this column needs `values_callable` to send the value
+    # instead; see `_node_type_column()` below. Every other enum here happens
+    # to have name == value, which is why only this one was ever affected --
+    # and why the mismatch survived: it is invisible until a row is actually
+    # written to Postgres.
     TRANSACTION = "transaction"
     AUTHORIZATION = "authorization"
     SETTLEMENT = "settlement"
@@ -128,15 +146,25 @@ class DisputeCase(Base):
     )
     amount_minor: Mapped[int] = mapped_column(BigInteger, CheckConstraint("amount_minor > 0"), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
-    filed_at: Mapped[datetime] = mapped_column(nullable=False)
+    filed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     reg_regime: Mapped[str] = mapped_column(
         String, CheckConstraint("reg_regime IN ('REG_Z', 'REG_E')"), nullable=False
     )
-    ack_deadline: Mapped[datetime] = mapped_column(nullable=False)
-    resolve_deadline: Mapped[datetime] = mapped_column(nullable=False)
-    merchant_response_deadline: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    # Regulatory clocks. These columns existed from the first migration and
+    # nothing ever read them -- no timer, no scheduler, no job. They are now
+    # driven by arbiter.decision.deadlines, and the *_at columns below
+    # record what the clock actually did so a breach is a queryable fact.
+    ack_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    acknowledged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolve_deadline: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    merchant_response_deadline: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    merchant_window_expired_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     merchant_responded: Mapped[bool] = mapped_column(nullable=False, default=False)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    # Reg E 12 CFR 1005.11(c)(2): provisional credit within 10 business days
+    # when the investigation extends beyond the determination window.
+    provisional_credit_deadline: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    provisional_credit_issued_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
         Index("ix_dispute_case_state_deadline", "state", "resolve_deadline"),
@@ -156,7 +184,7 @@ class Artifact(Base):
     mime_type: Mapped[str] = mapped_column(String, nullable=False)  # SNIFFED, never Content-Type
     byte_size: Mapped[int] = mapped_column(BigInteger, CheckConstraint("byte_size <= 26214400"), nullable=False)
     uploaded_by: Mapped[PartyEnum] = mapped_column(Enum(PartyEnum, name="party", native_enum=True), nullable=False)
-    uploaded_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     scan_status: Mapped[str] = mapped_column(String, nullable=False, default="PENDING")
     forensics: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
@@ -169,7 +197,7 @@ class MerkleBatch(Base):
     tree_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     sth_signature: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     tsa_token: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
-    sealed_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    sealed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
 class AdecCommitmentRow(Base):
@@ -179,11 +207,11 @@ class AdecCommitmentRow(Base):
     merchant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     commitment_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     artifact_type: Mapped[str] = mapped_column(String, nullable=False)
-    event_time: Mapped[datetime] = mapped_column(nullable=False)  # merchant-claimed
+    event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)  # merchant-claimed
     batch_id: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("merkle_batch.batch_id"), nullable=True)
     leaf_index: Mapped[Optional[int]] = mapped_column(nullable=True)
-    committed_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)  # server-observed, AUTHORITATIVE
-    revealed_at: Mapped[Optional[datetime]] = mapped_column(nullable=True)
+    committed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)  # server-observed, AUTHORITATIVE
+    revealed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     reveal_valid: Mapped[Optional[bool]] = mapped_column(nullable=True)
 
     __table_args__ = (
@@ -198,11 +226,25 @@ class EvidenceNodeRow(Base):
     node_id: Mapped[uuid.UUID] = _uuid_pk()
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("dispute_case.case_id", ondelete="CASCADE"), nullable=False)
     node_type: Mapped[EvidenceNodeTypeEnum] = mapped_column(
-        Enum(EvidenceNodeTypeEnum, name="evidence_node_type", native_enum=True), nullable=False
+        # `values_callable` is load-bearing, not decoration. SQLAlchemy's
+        # `Enum` binds an enum member by its NAME unless told otherwise, so
+        # this column sent 'ORDER' at a Postgres type whose labels are
+        # lowercase ('order'), and EVERY evidence-node insert failed with
+        # `InvalidTextRepresentation: invalid input value for enum
+        # evidence_node_type: "ORDER"`. That is: no case could be adjudicated
+        # against a real database at all. The whole test suite passes because
+        # it builds evidence graphs in memory and never persists one.
+        Enum(
+            EvidenceNodeTypeEnum,
+            name="evidence_node_type",
+            native_enum=True,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=False,
     )
     attrs: Mapped[dict] = mapped_column(JSONB, nullable=False)
     valid_time: Mapped[Optional[Any]] = mapped_column(TSTZRANGE, nullable=True)
-    asserted_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    asserted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     provenance: Mapped[ProvenanceTierEnum] = mapped_column(
         Enum(ProvenanceTierEnum, name="provenance_tier", native_enum=True), nullable=False
     )
@@ -267,8 +309,38 @@ class DecisionRow(Base):
     escalation_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     merchant_silent: Mapped[bool] = mapped_column(nullable=False, default=False)  # R13-recovery metric
     llm_rejections: Mapped[int] = mapped_column(nullable=False, default=0)  # hallucinated advocate assertions caught this case
-    decided_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    provisional_credit_due: Mapped[bool] = mapped_column(nullable=False, default=False)  # Reg E 12 CFR 1005.11 -- see arbiter.horn provisional-credit axis
+    # What the MANDATORY four-layer contradiction pipeline actually did for
+    # this decision: which layers ran, which could not, and whether that
+    # forced escalation. Stored rather than recomputed on read -- recomputing
+    # would answer "what would the pipeline do now?", which drifts as the
+    # environment changes (e.g. once the NLI weights are installed).
+    contradiction_analysis: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # The grounded narration this decision was explained with:
+    # `{text, source, citations[{sentence_idx, node_id}]}` from
+    # arbiter.narrate. Stored, not recomputed on read -- it cites evidence
+    # node ids and was rendered against the rulepack this row pinned, so a
+    # later re-render answers "what would we say now?" rather than "what did
+    # we tell the parties?". `source` also preserves whether an LLM
+    # narration was generated and then discarded for failing citation
+    # grounding ("template_fallback"), which is the measurement that says
+    # whether CLAUDE.md invariant #5's veto is doing anything.
+    narration: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # arbiter.eligibility.EligibilityResult for this decision: which of the
+    # reason code's "Excluded Transactions" fired, every filing-window
+    # branch with its computed deadline, and any attribute the ledger could
+    # not supply. Populated on EVERY decision, not just ineligible ones --
+    # "the gate ran and found the right available" is the claim the audit
+    # trail needs to be able to make.
+    eligibility: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # Auto-resolved cases deliberately routed to a human anyway, so the
+    # calibration pool sees the region of the distribution the escalation
+    # path never visits (arbiter.decision.review_sampling).
+    selected_for_audit: Mapped[bool] = mapped_column(nullable=False, default=False)
+    review_selection_probability: Mapped[Optional[float]] = mapped_column(REAL, nullable=True)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     signature: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    key_epoch: Mapped[int] = mapped_column(nullable=False, default=0)  # which EventSigner epoch produced `signature` -- arbiter.audit.sign.KeyRing
 
     __table_args__ = (
         Index("ix_decision_case_decided", "case_id", "decided_at"),
@@ -298,10 +370,11 @@ class CaseEventRow(Base):
         String, CheckConstraint("actor_type IN ('human','service','advocate','referee')"), nullable=False
     )
     rulepack_hash: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
-    occurred_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     prev_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     event_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     signature: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    key_epoch: Mapped[int] = mapped_column(nullable=False, default=0)  # which EventSigner epoch produced `signature` -- arbiter.audit.sign.KeyRing
 
 
 # ============ CALIBRATION ============
@@ -317,7 +390,14 @@ class CalibrationSample(Base):
         Enum(OutcomeEnum, name="outcome", native_enum=True), nullable=False
     )  # world model or analyst. NEVER the rulepack.
     source: Mapped[str] = mapped_column(String, CheckConstraint("source IN ('SYNTHETIC','ANALYST')"), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    # Probability this case had of being reviewed at all. Escalated cases
+    # are 1.0; auto-resolved cases carry the audit-sampling rate. The gate
+    # weights by the inverse (arbiter.decision.review_sampling) -- without
+    # it the pool is a biased subsample of the deployment distribution and
+    # split-conformal's exchangeability assumption does not hold.
+    selection_probability: Mapped[Optional[float]] = mapped_column(REAL, nullable=True)
+    is_audit_sample: Mapped[bool] = mapped_column(nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (Index("ix_calibration_reason_source", "reason_code", "source"),)
 
@@ -340,6 +420,68 @@ class SeedTransaction(Base):
     merchant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
     amount_minor: Mapped[int] = mapped_column(BigInteger, nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
-    transaction_at: Mapped[datetime] = mapped_column(nullable=False)
+    transaction_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Which regulation governs disputes on this transaction. A property of
+    # the PRODUCT it settled on -- credit (Reg Z) vs prepaid/debit (Reg E) --
+    # which only the ledger knows. It used to come from the dispute-creation
+    # request body, so a card member could self-declare REG_E on a credit
+    # card and force provisional credit on every escalated case.
+    reg_regime: Mapped[str] = mapped_column(
+        String, CheckConstraint("reg_regime IN ('REG_Z','REG_E')", name="seed_transaction_reg_regime"),
+        nullable=False, default="REG_Z",
+    )
     network_facts: Mapped[dict] = mapped_column(JSONB, nullable=False)  # arbiter.network.loader.NetworkFacts, serialised
     world_truth: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)  # datagen ground truth, eval-only
+
+
+# ============ CRYPTO-SHREDDING (GDPR Article 17) ============
+# arbiter/privacy/shredding.py: per-subject (card_member_id/merchant_id)
+# symmetric key wrapping PII fields at rest. Erasure = deleting this row,
+# not the encrypted data itself -- the hash chain and Merkle commitments
+# over that data stay intact and verifiable; the plaintext just becomes
+# permanently unrecoverable. See that module's docstring for the full
+# rationale (case_event/decision are append-only by DB trigger, which is
+# in tension with a literal "delete the data" reading of Article 17).
+
+class SubjectKeyRow(Base):
+    __tablename__ = "subject_key"
+
+    subject_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    wrapped_key: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    erased_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# ============ ADJUDICATION QUEUE ============
+# Adjudication used to run inline in the HTTP request, holding a threadpool
+# worker for the full pipeline. A durable job row plus SELECT ... FOR UPDATE
+# SKIP LOCKED decouples it -- and keeps the queue in the same transaction as
+# the state change, eliminating the dual-write bug an external broker would
+# introduce at this scale (~10 QPS peak).
+
+
+class AdjudicationJob(Base):
+    __tablename__ = "adjudication_job"
+
+    job_id: Mapped[uuid.UUID] = _uuid_pk()
+    case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("dispute_case.case_id"), nullable=False)
+    state: Mapped[str] = mapped_column(
+        String,
+        CheckConstraint("state IN ('QUEUED','RUNNING','SUCCEEDED','FAILED')", name="adjudication_job_state"),
+        nullable=False, default="QUEUED",
+    )
+    attempts: Mapped[int] = mapped_column(nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(nullable=False, default=3)
+    requested_by: Mapped[str] = mapped_column(String, nullable=False)
+    error: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    decision_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    enqueued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Retry backoff. Without it a deterministically-failing case spins a
+    # worker at full speed until it exhausts max_attempts.
+    visible_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_adjudication_job_case", "case_id", "enqueued_at"),
+    )

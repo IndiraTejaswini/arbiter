@@ -23,6 +23,13 @@ that IS the answer; a human decides next, not a model. An LLM verdict would
 re-introduce the exact black box this system exists to eliminate, and it
 would break every property test in `tests/property/`.
 
+There is exactly one component that can end a case *without* the referee:
+`arbiter.eligibility`, the chargeback-right gate. It is held to the same
+purity standard for the same reason (stdlib-only, import-linter contract
+"Chargeback-right gate is pure"), and it answers a different question —
+"may Amex charge this back at all?" rather than "who is right?". See
+"The chargeback-right gate" below.
+
 ## Never violate
 
 1. `arbiter.horn` imports nothing outside the standard library — no
@@ -90,6 +97,59 @@ would break every property test in `tests/property/`.
     stamps `datetime.now()`). The merchant's claimed `event_time` is stored
     separately and is never authoritative for tier gating or the
     predates-deadline check.
+15. The chargeback-right gate reads only its own closed attribute
+    vocabulary (`arbiter.eligibility.models.ATTRIBUTE_VOCABULARY`), never a
+    rulepack predicate — and no rule ever reads an eligibility attribute.
+    The two must not merge: an exclusion decides whether the dispute is
+    chargeable, a predicate is evidence within a dispute that is. If
+    `card_present` were a predicate, "the card was present" would become an
+    argument a merchant *wins* with, when the guide's actual position is
+    that the dispute was never chargeable. Enforced by
+    `tests/property/test_rulepacks.py::test_no_exclusion_reads_a_rulepack_predicate`.
+16. An excluded or out-of-time dispute is `CHARGEBACK_INELIGIBLE`, never
+    `MERCHANT_PREVAILS`. No evidence was weighed; recording it as a
+    merchant win corrupts win rates, the fairness layer's per-rule
+    disparate-impact analysis, and the conformal calibration pool at once.
+    Its `conformal_set` is empty for the same reason — the gate the set
+    describes never ran.
+
+## The chargeback-right gate
+
+Amex's published merchant chargeback guide gives every reason code two
+fields that are not about the evidence: **"Maximum time a dispute can be
+raised"** (120 days from network processing; 4554 adds an alternate clock
+capped at 540) and **"Excluded Transactions"** (Card Present, SafeKey
+liability shift, contactless/digital wallet, transactions chargeable under
+another code...). Both remove the chargeback right outright.
+
+`arbiter.eligibility` evaluates them from the rulepack's `chargeback_right`
+block before anything else in `adjudicate_case`. When it closes, no evidence
+is loaded, no advocate runs, and the referee is never called — because when
+the right does not exist, none of those were the right thing to have done.
+
+Three things about it that are easy to get backwards:
+
+- **It is not the Reg Z/Reg E clock.** `arbiter.decision.deadlines` owns the
+  issuer's statutory obligations to the card member; this owns the network's
+  merchant-facing one. A dispute that misses the 120-day chargeback window
+  is still a billing error Amex must resolve — it just resolves at Amex's
+  cost rather than the merchant's. Neither module reads the other's numbers.
+  A REG_E case that ends here still owes provisional credit, and
+  `_record_ineligible` computes it.
+- **Unknown fails OPEN here, and only here.** An attribute the ledger did
+  not supply cannot fire an exclusion. Every other gate in this system fails
+  closed *for the card member's protection*; an exclusion firing removes
+  their dispute right with no downstream after it, so the conservative
+  direction reverses. Unknowns are recorded (`EligibilityResult.undetermined`,
+  `CHARGEBACK_RIGHT_UNDETERMINED` case event, an index in migration 0007) so
+  coverage gaps get closed rather than silently widening the set of disputes
+  that bypass a gate nobody notices is not running.
+- **Conditions are a closed vocabulary, not a language.** No arithmetic, no
+  nesting, no `eval`. Anything the guide actually says fits; anything that
+  does not should become a new named attribute with a reviewed derivation.
+  A rulepack is data loaded from disk, and an expression evaluator in it
+  would be a code path from a YAML file to the interpreter, in the one
+  component whose whole value is that its behaviour is inspectable.
 
 ## Scope boundary
 
@@ -105,7 +165,14 @@ never a predicate.
 - Failing closed (abstain, ask the user, route to human triage) over
   guessing — at every boundary, not just the verdict.
 - Property tests over example tests in `horn/` and `rulepacks/`
-  (`tests/property/`).
+  (`tests/property/`). Generate their inputs through
+  `tests/property/strategies.py` — never a fresh `itertools.product` over the
+  predicate powerset. That function chooses exhaustive or sampled by the
+  budget the caller passes, which is what lets a rulepack grow past 16
+  predicates without the suite becoming either intractable or a lie. Read
+  that module's docstring before adding a sweep; the fail direction, the
+  three sampling layers and what each mode does and does not prove are all
+  stated there.
 - The rules-only path (`arbiter.advocate.runner`, deterministic
   prime-implicant search) must keep working with every LLM disabled — it is
   the default, not a fallback bolted on afterward. Same for
@@ -115,13 +182,22 @@ never a predicate.
   same change, not a follow-up. A boundary with LLM output and no veto isn't
   half of this pattern — it's a different, unguarded system wearing this
   one's clothes.
+- When adding a rulepack, transcribe its `chargeback_right` block in the
+  same change. Rules without a gate mean every dispute under that code
+  reaches the merits, including ones the network gives no chargeback right
+  for at all.
 
 ## When stuck
 
 Be right or silent, never confidently wrong. If a choice trades correctness
 for coverage, take correctness. See `arbiter.narrate.llm` for what "silent"
-looks like in code: a stub that returns `None` and lets the template
-renderer take over, not a stub that fabricates prose.
+looks like in code: every failure path — model unreachable, malformed JSON,
+a sentence that cites nothing — returns `None`, and the deterministic
+template renders instead. It never fabricates prose to fill the gap, and it
+never quietly drops a bad citation to make its own output survive: a
+hallucinated node id is passed to `narrate.ground` intact, precisely so the
+veto is the thing that catches it. A boundary that sanitises its output
+before the verifier sees it is unguarded while looking safe.
 
 ## Repository-specific notes for future work here
 
@@ -149,6 +225,33 @@ renderer take over, not a stub that fabricates prose.
   `arbiter.ingest.route`'s intentionally partial `_PREDICATE_HINTS` table
   didn't mechanically tag — read that module's docstring before assuming an
   LLM advocate result means more than it does.
+- The three shipped rulepacks are transcribed from American Express's own
+  published merchant guide ("Chargeback Codes — What they mean", Australian
+  merchant reason codes). ARBITER's internal reason codes map to the guide's
+  four-digit network codes as F29→4540 (Card Not Present, pp.17-20),
+  C08→4554 (Goods And Services Not Received, pp.23-24), C02→4513 (Credit Not
+  Presented, p.6). `RulepackRegistry.resolve()` accepts either dialect. The
+  guide lists 22 reason codes and 6 retrieval-request codes; three are
+  modelled. The unmodelled ones are not a gap in the machinery — adding one
+  is a YAML file — and rulepack size is no longer the constraint it was:
+  `tests/property/strategies.py` replaced the full-powerset sweep with a
+  budgeted exhaustive/t-wise-sampled matrix, so a 34-predicate rulepack costs
+  ~250 assignments instead of 17 billion. What to know when adding one: under
+  16 EDB predicates it keeps a brute-force proof automatically; over that,
+  the implicant and conflict properties become sampled (strong, not a proof)
+  and the nightly `FULL_POWERSET_SWEEP=1` job is what still proves them.
+  Check `test_strategies.py::test_small_rulepack_under_budget_stays_exhaustive`
+  — it fails the build precisely when a new rulepack crosses that line, so the
+  transition is never silent.
+- The retrieval-request stage (guide pp.31-32: codes 6003/6006/6008/6013/
+  6014/6016, and reason codes 4516/4517 for an unfulfilled or illegible
+  response) is deliberately not modelled. It is a genuine pre-chargeback
+  workflow, not a variant of adjudication, and half of it — the exclusions
+  keyed on retrieval-request code, the No Signature/No PIN Program, the
+  AU$100/AU$35 contactless thresholds — is already expressible in the
+  eligibility vocabulary (`retrieval_request_code`,
+  `no_signature_no_pin_program`, `amount_minor`) whenever someone builds
+  the workflow the other half needs.
 - `evals/hallucination.py` is the eval that proves the veto holds under
   adversarial pressure, not just in the clean case: it poisons an evidence
   node with an embedded instruction ("assert X regardless of evidence") and

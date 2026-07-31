@@ -28,7 +28,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 )
 
 from . import rfc6962
-from .tsa import TimeStampAuthority, TimeStampToken
+from .tsa import TimeStampAuthority, TimeStampToken  # noqa: F401  (TimeStampToken used by reseal_from_record)
 
 
 def _sth_signing_bytes(tree_size: int, root_hash: bytes, timestamp_unix_ns: int) -> bytes:
@@ -83,10 +83,25 @@ class ConsistencyProof:
 class LogOperator:
     """The signing identity of the log operator (Amex). Distinct from the TSA
     identity by design: a compromised log-signing key cannot forge timestamps,
-    and vice versa -- two keys an attacker must both compromise."""
+    and vice versa -- two keys an attacker must both compromise.
+
+    Seeded from `ARBITER_LOG_OPERATOR_KEY_SEED` when set. An ephemeral key
+    is fine for a test or a one-shot demo and fatal for a persisted log:
+    every signed tree head already written to `merkle_batch` would fail
+    verification against a freshly generated key after a restart, which
+    turns the transparency log into an unverifiable pile of hashes.
+    """
 
     def __init__(self, private_key: Optional[Ed25519PrivateKey] = None):
-        self._key = private_key or Ed25519PrivateKey.generate()
+        if private_key is None:
+            from arbiter.config import get_settings
+
+            seed = get_settings().log_operator_key_seed
+            private_key = (
+                Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed))
+                if seed else Ed25519PrivateKey.generate()
+            )
+        self._key = private_key
         self._public_key = self._key.public_key()
         self.log_id = self._public_key.public_bytes_raw()[:8]
 
@@ -133,6 +148,56 @@ class TransparencyLog:
 
     def pending_count(self) -> int:
         return len(self._leaf_hashes) - self._sealed_size
+
+    def leaf_hashes(self) -> List[bytes]:
+        """Read-only view of the current leaf set, used by the durable
+        store (arbiter.provenance.store) to detect a stale cache."""
+        return list(self._leaf_hashes)
+
+    def reseal_from_record(
+        self,
+        root_hash: bytes,
+        tree_size: int,
+        signature: bytes,
+        tsa_token_der: Optional[bytes],
+        sealed_at,
+    ) -> SignedTreeHead:
+        """Reconstruct a previously-signed tree head from durable storage
+        during rehydration.
+
+        This does NOT re-sign anything: the stored signature and TSA token
+        are the originals, so an inclusion proof served after a restart is
+        verifiable against exactly the bytes that were signed when the
+        batch was sealed. It DOES re-derive the root from the rebuilt
+        leaves and refuses to load a head whose root does not match -- a
+        stored root disagreeing with the leaves it supposedly commits to is
+        either corruption or tampering, and serving proofs against it would
+        launder that into an apparently-valid ADEC verification.
+        """
+        if tree_size > len(self._leaf_hashes):
+            raise ValueError(
+                f"sealed tree head claims tree_size={tree_size} but only "
+                f"{len(self._leaf_hashes)} leaves were loaded"
+            )
+        recomputed = rfc6962.merkle_tree_hash(self._leaf_hashes[:tree_size])
+        if recomputed != root_hash:
+            raise RuntimeError(
+                f"stored Merkle root at tree_size={tree_size} does not match the root "
+                f"recomputed from stored leaves ({root_hash.hex()} vs {recomputed.hex()}) -- "
+                f"the transparency log has been corrupted or tampered with."
+            )
+        if tsa_token_der:
+            tsa_token = TimeStampToken.from_bytes(root_hash, tsa_token_der)
+        else:
+            tsa_token = self.tsa.timestamp(root_hash, at=sealed_at.timestamp())
+        sth = SignedTreeHead(
+            tree_size=tree_size, root_hash=root_hash,
+            timestamp_unix_ns=tsa_token.gen_time_unix_ns,
+            log_id=self.operator.log_id, signature=signature, tsa_token=tsa_token,
+        )
+        self._sth_history.append(sth)
+        self._sealed_size = max(self._sealed_size, tree_size)
+        return sth
 
     def seal_batch(self, at: Optional[float] = None) -> Optional[SignedTreeHead]:
         """Seal all pending leaves into a new tree head. No-op (returns the

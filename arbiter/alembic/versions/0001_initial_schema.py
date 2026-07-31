@@ -9,8 +9,9 @@ from __future__ import annotations
 from typing import Sequence, Union
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy.dialects import postgresql as pg
+
+from alembic import op
 
 revision: str = "0001"
 down_revision: Union[str, None] = None
@@ -19,21 +20,51 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    provenance_tier = pg.ENUM("COMMITTED", "NETWORK", "SUBMITTED", "ASSERTED", name="provenance_tier")
+    # `create_type=False` on every one of these is load-bearing, not style.
+    #
+    # A `pg.ENUM` used as a column type emits its own `CREATE TYPE` when the
+    # table is created. These are ALSO created explicitly below, so without
+    # this flag each type is created twice and the migration dies on
+    # `DuplicateObject: type "case_state" already exists` against any clean
+    # database -- i.e. this migration had never actually been run.
+    #
+    # It was reported as verified because `alembic upgrade --sql` renders it
+    # without complaint: an offline render checks that the SQL can be
+    # GENERATED, never that it can be EXECUTED, and a duplicate statement is
+    # perfectly renderable. The duplicate is visible in that output — two
+    # `CREATE TYPE case_state` lines — but only if somebody counts them.
+    #
+    # Creating them explicitly (rather than letting the first table that
+    # references each one do it) is still the right shape: several tables
+    # share these types, so leaving it implicit makes creation order decide
+    # which table owns the type, and `downgrade()` then has nothing stable
+    # to drop.
+    provenance_tier = pg.ENUM(
+        "COMMITTED", "NETWORK", "SUBMITTED", "ASSERTED",
+        name="provenance_tier", create_type=False,
+    )
     case_state = pg.ENUM(
         "INTAKE", "GATHERING", "AWAITING_EVIDENCE", "ANALYSING", "ADJUDICATED",
-        "ESCALATED", "SETTLED", "DEFLECTED", "REOPENED", name="case_state",
+        "ESCALATED", "SETTLED", "DEFLECTED", "REOPENED",
+        name="case_state", create_type=False,
     )
-    party = pg.ENUM("CARD_MEMBER", "MERCHANT", "NEUTRAL", name="party")
-    outcome = pg.ENUM("CARD_MEMBER_PREVAILS", "MERCHANT_PREVAILS", "SPLIT", "INSUFFICIENT_EVIDENCE", name="outcome")
-    contradiction_severity = pg.ENUM("LOW", "MEDIUM", "HIGH", "CRITICAL", name="contradiction_severity")
+    party = pg.ENUM("CARD_MEMBER", "MERCHANT", "NEUTRAL", name="party", create_type=False)
+    outcome = pg.ENUM(
+        "CARD_MEMBER_PREVAILS", "MERCHANT_PREVAILS", "SPLIT", "INSUFFICIENT_EVIDENCE",
+        name="outcome", create_type=False,
+    )
+    contradiction_severity = pg.ENUM(
+        "LOW", "MEDIUM", "HIGH", "CRITICAL",
+        name="contradiction_severity", create_type=False,
+    )
     evidence_node_type = pg.ENUM(
         "transaction", "authorization", "settlement", "avs_result", "cvv_result",
         "three_ds_result", "device_session", "descriptor", "prior_transaction",
         "order", "line_item", "shipment", "delivery_scan", "signature_capture",
         "communication", "terms_acceptance", "refund_policy", "refund", "credit",
         "address", "identity", "statement_line", "service_access_log",
-        "attestation", "contradiction", "claim", name="evidence_node_type",
+        "attestation", "contradiction", "claim",
+        name="evidence_node_type", create_type=False,
     )
 
     bind = op.get_bind()

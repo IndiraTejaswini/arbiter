@@ -22,9 +22,9 @@ number (evals/accuracy.py).
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Literal, Optional
+from typing import Literal
 
 UTC = timezone.utc
 

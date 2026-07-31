@@ -8,7 +8,60 @@
 
 rulepack_id: amex-C02-v1
 reason_code: C02
-version: "1.0.0"
+version: "1.1.0"
+
+# Party-facing catalogue metadata -- prose about the rules, not a check, so
+# neither field enters content_hash(). See C08's rulepack for the full note
+# on why this lives here rather than in the console.
+title: Credit not processed
+description: A refund or credit you were owed was never applied.
+
+# -- The chargeback right itself (arbiter.eligibility) --------------------
+#
+# American Express, "Chargeback Codes -- What they mean" (Australian
+# merchant reason codes), Reason Code 4513 "Credit Not Presented", p.6.
+#
+# Three independent 120-day clocks, and unlike C08's they are genuinely
+# independent alternatives with no "whichever occurred first" and no
+# absolute cap -- the guide's wording is a plain "or" across all three. The
+# branch model represents that directly: any open branch keeps the dispute
+# in time.
+chargeback_right:
+  network_code: "4513"
+  source: >
+    American Express, "Chargeback Codes -- What they mean" (Australian
+    merchant chargeback reason codes), Reason Code 4513 Credit Not
+    Presented, p.6.
+  merchant_challenge_days: 20
+
+  filing_window:
+    - branch_id: C02_WINDOW_PROCESSED
+      days: 120
+      from: transaction_processed_at
+      description: "120 days from the date the American Express Network processed the Transaction."
+
+    - branch_id: C02_WINDOW_CANCELLED_RETURNED
+      days: 120
+      from: goods_returned_or_cancelled_at
+      description: >
+        120 days from the date the goods and/or services were cancelled,
+        refused or returned.
+
+    - branch_id: C02_WINDOW_CREDIT_ACKNOWLEDGED
+      days: 120
+      from: credit_acknowledgment_at
+      description: >
+        120 days from the date the Merchant provided the Card Member the
+        written acknowledgement of Credit due.
+
+  # "Excluded Transactions: None." Declared explicitly, as an empty list
+  # with this comment, rather than by omitting the key. The two are not the
+  # same statement: an omitted block means nobody has transcribed the
+  # reason code's exclusions yet, while this means the guide was read and
+  # says there are none. `arbiter.eligibility.evaluate_chargeback_right`
+  # reports the distinction, and a reviewer asking "why was no exclusion
+  # considered here?" gets an answer either way.
+  exclusions: []
 
 predicate_schema:
   - return_delivered_to_merchant
@@ -25,11 +78,58 @@ predicate_schema:
 decision_predicates:
   MERCHANT_WINS: merchant_wins
   CARD_MEMBER_WINS: card_member_wins
+  SPLIT: split_outcome
+
+# Provenance-tier gate per predicate (C2). `refund_issued` and its
+# derivatives (`refund_amount_matches_expected`, `partial_refund_issued`)
+# are tier-gated at NETWORK deliberately -- a refund is a real settlement
+# transaction, and every merchant-favoring rule in this pack (C02_R6,
+# C02_R7, C02_R8) or the split path (C02_R_SPLIT_SHORTFALL) turns on
+# whether one actually happened, not on a merchant's claim that it did.
+# `return_window_expired` and `dispute_filed_before_return_received` are
+# date computations against network-timestamped events, also NETWORK.
+# Communications/promises/policy documents
+# (`merchant_refund_promise_on_record`, `cancellation_confirmed_by_
+# merchant`, `refund_policy_disclosed_at_sale`) stay at SUBMITTED --
+# exactly like C08's document predicates, the rule bodies that use them
+# require them in combination with a NETWORK-gated fact, never alone.
+predicates:
+  - id: return_delivered_to_merchant
+    party: CARD_MEMBER
+    min_tier: NETWORK
+  - id: refund_issued
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: refund_amount_matches_expected
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: merchant_refund_promise_on_record
+    party: CARD_MEMBER
+    min_tier: SUBMITTED
+  - id: cancellation_confirmed_by_merchant
+    party: CARD_MEMBER
+    min_tier: SUBMITTED
+  - id: service_never_rendered
+    party: CARD_MEMBER
+    min_tier: ASSERTED
+  - id: return_window_expired
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: dispute_filed_before_return_received
+    party: MERCHANT
+    min_tier: NETWORK
+  - id: partial_refund_issued
+    party: NEUTRAL
+    min_tier: NETWORK
+  - id: refund_policy_disclosed_at_sale
+    party: MERCHANT
+    min_tier: SUBMITTED
 
 rules:
   - rule_id: C02_R1
     head: card_member_wins
     description: The merchant received the returned item and has not refunded it.
+    legal_basis: "Reg Z 12 CFR 1026.13(a)(3) -- failure to reflect a credit to the account for returned merchandise is a billing error."
     body:
       - return_delivered_to_merchant
       - not refund_issued
@@ -37,6 +137,7 @@ rules:
   - rule_id: C02_R2
     head: card_member_wins
     description: Merchant's own communications promised a refund that was never issued.
+    legal_basis: "Reg Z 12 CFR 1026.13(a)(3) -- failure to reflect a promised credit to the account is a billing error."
     body:
       - merchant_refund_promise_on_record
       - not refund_issued
@@ -44,6 +145,7 @@ rules:
   - rule_id: C02_R3
     head: card_member_wins
     description: Merchant confirmed the cancellation but never issued the corresponding credit.
+    legal_basis: "Reg Z 12 CFR 1026.13(a)(3) -- failure to reflect a credit due on a confirmed cancellation is a billing error."
     body:
       - cancellation_confirmed_by_merchant
       - not refund_issued
@@ -51,15 +153,23 @@ rules:
   - rule_id: C02_R4
     head: card_member_wins
     description: Contracted service was never rendered and no refund followed.
+    legal_basis: "Reg Z 12 CFR 1026.13(a)(3) -- services not rendered as agreed, with no corresponding credit, is a billing error."
     body:
       - service_never_rendered
       - not refund_issued
 
-  - rule_id: C02_R5
-    head: card_member_wins
+  - rule_id: C02_R_SPLIT_SHORTFALL
+    head: split_outcome
     description: >
-      A refund was issued but for the wrong amount, and no full refund
-      followed -- the shortfall itself is the unprocessed credit.
+      A refund was issued but for less than the expected amount, and no
+      further refund followed. The merchant's partial performance is real
+      evidence, not absence of evidence -- treating this identically to a
+      full non-refund (card_member_wins) would ignore money the merchant
+      already returned; treating it as a full merchant win would ignore
+      the shortfall itself, which is exactly what was disputed. The correct
+      resolution is a SPLIT: the card member is due the remainder, not the
+      full disputed amount.
+    legal_basis: "Reg Z 12 CFR 1026.13(a)(3) establishes the billing-error category (failure to reflect the full credit due); the SPLIT resolution crediting only the shortfall is ARBITER's own fairness logic, not a literal provision of the regulation."
     body:
       - partial_refund_issued
       - not refund_amount_matches_expected
@@ -67,6 +177,7 @@ rules:
   - rule_id: C02_R6
     head: merchant_wins
     description: A refund was issued for the correct, expected amount.
+    legal_basis: "Reg Z 12 CFR 1026.13(a)(3) -- no billing error where the credit due was already reflected on the account."
     body:
       - refund_issued
       - refund_amount_matches_expected
@@ -77,6 +188,7 @@ rules:
       The merchant's disclosed return window had already expired at the
       time of the claim, and the merchant made no separate promise to
       refund outside that policy.
+    legal_basis: "Reg Z 12 CFR 1026.13(a)(3) -- no billing error where the claimed credit was never owed under a policy disclosed at sale and not separately promised."
     body:
       - refund_policy_disclosed_at_sale
       - return_window_expired
@@ -87,6 +199,7 @@ rules:
     description: >
       The card member filed the dispute before the merchant could even have
       received the returned item, and made no separate refund promise.
+    legal_basis: "Reg Z 12 CFR 1026.13(a)(3) -- no billing error where a credit could not yet have been due at the time the dispute was filed."
     body:
       - dispute_filed_before_return_received
       - not merchant_refund_promise_on_record

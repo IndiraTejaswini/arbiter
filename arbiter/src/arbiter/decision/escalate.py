@@ -12,13 +12,14 @@ spec's own framing: "Human reads it -- no automated action rides on it").
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from arbiter.advocate.contract import ArgumentGraph
 from arbiter.decision.adjudicate import RefereeResult
 from arbiter.decision.confidence import ConfidenceVector
 from arbiter.decision.conformal import AbstentionDecision
 from arbiter.evidence.contradiction import Contradiction
+from arbiter.fairness.cross_case import CrossCaseSignal
 from arbiter.horn.counterfactual import Counterfactual
 
 
@@ -34,6 +35,14 @@ class EscalationDossier:
     confidence: ConfidenceVector
     abstention: AbstentionDecision
     escalation_reason: str
+    # Population-level findings (arbiter.fairness.cross_case) relevant to
+    # THIS case -- device-fingerprint rings, template reuse across other
+    # disputes. Dossier-only, by construction: nothing upstream of this
+    # dataclass (the referee, predicate derivation) ever sees these, and
+    # arbiter.horn is mechanically forbidden from importing the module
+    # that produces them (pyproject.toml import-linter). A human reviewer
+    # reading the dossier is the only consumer.
+    cross_case_signals: Tuple[CrossCaseSignal, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -51,6 +60,7 @@ class EscalationDossier:
             "confidence": self.confidence.to_dict(),
             "abstention": self.abstention.to_dict(),
             "escalation_reason": self.escalation_reason,
+            "cross_case_signals": [s.to_dict() for s in self.cross_case_signals],
         }
 
 
@@ -64,6 +74,7 @@ def build_dossier(
     counterfactuals: Dict[str, Counterfactual],
     confidence: ConfidenceVector,
     abstention: AbstentionDecision,
+    cross_case_signals: Tuple[CrossCaseSignal, ...] = (),
 ) -> EscalationDossier:
     if referee_result.evaluation.conflicting_outcomes:
         reason = (
@@ -86,4 +97,5 @@ def build_dossier(
         confidence=confidence,
         abstention=abstention,
         escalation_reason=reason,
+        cross_case_signals=cross_case_signals,
     )

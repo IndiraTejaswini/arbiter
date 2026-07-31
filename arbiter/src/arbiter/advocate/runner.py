@@ -77,7 +77,7 @@ class Advocate:
         what should have blocked the rule. Checking only the minimized MWC's
         remaining literals could report "fully satisfied" for a rule the
         real engine would never fire -- covered by
-        tests/property/test_rulepacks.py::test_advocate_completeness_matches_referee_exhaustive.
+        tests/property/test_rulepacks.py::test_advocate_completeness_matches_referee.
         """
         head = rulepack.decision_predicates[self.target_outcome]
         true_preds = {p for p, f in facts.items() if f.is_true}

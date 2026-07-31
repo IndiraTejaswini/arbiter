@@ -40,16 +40,37 @@ class ForensicsReport:
         }
 
 
+def count_incremental_updates(data: bytes) -> int:
+    """Number of times this PDF was saved after its original creation.
+
+    A PDF incremental update appends a new body, a new cross-reference
+    section, a new trailer, and another `%%EOF` marker rather than
+    rewriting the file. So `count(%%EOF) - 1` is the number of incremental
+    saves, and it is derived from the byte stream itself -- not from
+    metadata a forger controls.
+
+    This replaces a check that never worked: `incremental` was initialised
+    to False and never reassigned, and the branch that was supposed to set
+    it tested `doc.is_dirty`, which is always False on a freshly opened
+    document because it means "has unsaved changes in THIS session." PDF
+    incremental-update analysis is the first item in the architecture
+    document's forensics list and it always reported False.
+    """
+    return max(0, data.count(b"%%EOF") - 1)
+
+
 def analyze_pdf(data: bytes, filed_at_unix: float | None) -> ForensicsReport:
     """PDF incremental-update chain + ModDate vs filed_at + producer
-    mismatch. Uses PyMuPDF's metadata surface; this is a light heuristic
-    check, not a full forensic toolchain."""
+    mismatch. Uses PyMuPDF's metadata surface plus direct byte inspection;
+    this is a light heuristic check, not a full forensic toolchain."""
     import fitz  # PyMuPDF
 
     findings: list[str] = []
     incremental = False
     moddate_after = False
     producer_suspicious = False
+
+    revisions = count_incremental_updates(data)
 
     try:
         doc = fitz.open(stream=data, filetype="pdf")
@@ -60,18 +81,27 @@ def analyze_pdf(data: bytes, filed_at_unix: float | None) -> ForensicsReport:
             findings.append(f"suspicious producer metadata: {producer!r}")
 
         moddate_raw = metadata.get("modDate", "")
-        if moddate_raw and filed_at_unix is not None:
-            ts = _parse_pdf_date(moddate_raw)
-            if ts is not None and ts > filed_at_unix:
-                moddate_after = True
-                findings.append("ModDate postdates dispute filing")
+        moddate_ts = _parse_pdf_date(moddate_raw) if moddate_raw else None
+        if moddate_ts is not None and filed_at_unix is not None and moddate_ts > filed_at_unix:
+            moddate_after = True
+            findings.append("ModDate postdates dispute filing")
 
-        # Incremental-update detection: PyMuPDF exposes xref trailer count;
-        # more than one generation means the file was saved more than once
-        # after its original creation -- a real signal, checked mechanically
-        # rather than assumed.
-        if doc.xref_length() > 0 and getattr(doc, "is_dirty", False):
-            findings.append("document has unsaved/incremental edits in this session")
+        if revisions > 0:
+            findings.append(
+                f"document was saved {revisions} time(s) after creation "
+                f"(incremental update chain, {revisions + 1} %%EOF markers)"
+            )
+            # An incremental update is only a *forensic* signal when it
+            # happened after the dispute existed -- a receipt legitimately
+            # revised months earlier is not evidence of anything. Absent a
+            # filing time we record the revision count without asserting
+            # the flag, per this module's "signals, never proof" contract.
+            if moddate_after or (filed_at_unix is not None and moddate_ts is None):
+                incremental = True
+                findings.append(
+                    "incremental update chain present and the document's last "
+                    "modification cannot be shown to predate the dispute"
+                )
         doc.close()
     except Exception as e:  # malformed PDF -- itself a forensic signal
         findings.append(f"failed to parse as PDF: {e}")
@@ -105,8 +135,9 @@ def perceptual_hash_image(data: bytes) -> str | None:
     across cases (the same image resubmitted with edited dates). Not a
     cryptographic hash -- collisions are the point."""
     try:
-        from PIL import Image
         import io
+
+        from PIL import Image
 
         img = Image.open(io.BytesIO(data)).convert("L").resize((8, 8))
         pixels = list(img.getdata())

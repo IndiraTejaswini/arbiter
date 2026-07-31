@@ -45,10 +45,95 @@
           "head": { "type": "string", "description": "The predicate this rule derives when its body is satisfied." },
           "body": {
             "type": "array",
-            "items": { "type": "string" },
-            "description": "Conjunction of literals. A literal is a predicate name, or 'not <predicate>' for negation. Negation is restricted to EDB predicates (arbiter.horn.clause's module docstring) -- negating a head predicate raises StratificationError at load time."
+            "description": "Conjunction of body items. An item is either a literal (a predicate name, or 'not <predicate>' for negation) or a threshold group. Negation is restricted to EDB predicates (arbiter.horn.clause's module docstring) -- negating a head predicate raises StratificationError at load time.",
+            "items": {
+              "oneOf": [
+                { "type": "string" },
+                {
+                  "type": "object",
+                  "required": ["at_least"],
+                  "additionalProperties": false,
+                  "description": "Threshold ('N of M') group. The Amex chargeback guide writes compelling evidence this way throughout -- RC 4540 asks for 'three (3) or more of the following' (p.19) and 'at least two (2) of the following items' (p.20). arbiter.rulepack.loader expands the group at LOAD TIME into one ordinary conjunctive Horn clause per combination, suffixing the authored rule_id ('R1' -> 'R1#1', 'R1#2', ...). The engine, prime-implicant enumeration and the counterfactual ledger never see a threshold. Expansion is capped at MAX_THRESHOLD_EXPANSION (128) clauses per rule.",
+                  "properties": {
+                    "at_least": {
+                      "type": "object",
+                      "required": ["n", "of"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "n": { "type": "integer", "minimum": 1 },
+                        "of": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+                      }
+                    }
+                  }
+                }
+              ]
+            }
           },
-          "description": { "type": "string" }
+          "description": { "type": "string" },
+          "legal_basis": { "type": "string", "description": "Regulatory/network citation this rule encodes. Surfaced in the proof tree; excluded from content_hash, like `description`." }
+        }
+      }
+    },
+
+    "chargeback_right": {
+      "type": "object",
+      "description": "The network chargeback right for this reason code: the guide's 'Maximum time a dispute can be raised' and 'Excluded Transactions' entries. Evaluated by arbiter.eligibility BEFORE the referee -- when it closes, no evidence is loaded, no advocate runs, and no rule is evaluated. Pinned into RulePack.content_hash() because it can end a case. NOT the same clock as Reg Z/Reg E (arbiter.decision.deadlines): this is a merchant-facing right the issuer holds, and a dispute that misses it is still a billing error the issuer must resolve.",
+      "required": ["network_code"],
+      "properties": {
+        "network_code": { "type": "string", "description": "The four-digit Amex network reason code from the published guide, e.g. '4540'. Unique across rulepacks; arbiter.rulepack.registry.resolve() routes disputes filed under either dialect." },
+        "source": { "type": "string", "description": "Citation into the published guide, including page numbers." },
+        "merchant_challenge_days": { "type": "integer", "description": "'Maximum time to challenge a dispute' -- 20 days from the date of Chargeback for every code in the guide. The same figure arbiter.decision.deadlines enforces as MERCHANT_RESPONSE_DAYS." },
+        "filing_window": {
+          "type": "array",
+          "description": "Alternative clocks; a dispute is in time if ANY branch is open, matching the guide's 'or' between clauses.",
+          "items": {
+            "type": "object",
+            "required": ["branch_id", "days", "from"],
+            "properties": {
+              "branch_id": { "type": "string" },
+              "days": { "type": "integer", "minimum": 1 },
+              "from": {
+                "description": "Name of a DATETIME attribute in arbiter.eligibility.models.ATTRIBUTE_VOCABULARY, or a LIST of them for the guide's 'whichever occurred first' construction (RC 4554) -- in which case the EARLIEST known anchor starts the clock. A list is not an OR: modelling it as one would let the later date govern and be materially more permissive than the guide.",
+                "oneOf": [
+                  { "type": "string" },
+                  { "type": "array", "minItems": 1, "items": { "type": "string" } }
+                ]
+              },
+              "absolute_cap_days": { "type": "integer", "description": "Backstop that closes this branch regardless, e.g. RC 4554's 'not exceeding five hundred and forty (540) days'. Requires cap_from." },
+              "cap_from": { "type": "string", "description": "DATETIME attribute the cap is measured from -- usually transaction_processed_at, NOT the branch's own anchor." },
+              "description": { "type": "string" }
+            }
+          }
+        },
+        "exclusions": {
+          "type": "array",
+          "description": "The guide's 'Excluded Transactions' bullets. Conditions within one exclusion are ANDed; exclusions are ORed. An EMPTY array is a meaningful statement ('Excluded Transactions: None.') and is not the same as omitting the key, which means nobody has transcribed the reason code yet. An exclusion with no conditions is rejected at load time -- it would exclude every transaction under the code.",
+          "items": {
+            "type": "object",
+            "required": ["id", "when"],
+            "properties": {
+              "id": { "type": "string" },
+              "description": { "type": "string" },
+              "legal_basis": { "type": "string" },
+              "when": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": ["attribute"],
+                  "description": "One typed comparison against one attribute from the CLOSED vocabulary in arbiter.eligibility.models.ATTRIBUTE_VOCABULARY. Exactly one operator key must be present. There is deliberately no expression language: a rulepack is data loaded from disk, and an evaluator in it would be a code path from a YAML file to the interpreter in the one component whose value is that its behaviour is inspectable. An attribute name outside the vocabulary fails the API's boot, so a typo can never become an exclusion that quietly never fires.",
+                  "properties": {
+                    "attribute": { "type": "string" },
+                    "is": { "type": "boolean", "description": "BOOL attributes only." },
+                    "equals": { "description": "STRING or INT attributes." },
+                    "one_of": { "type": "array", "description": "Membership. For a STRING_LIST attribute, matches if the sets intersect -- this is how cross-code precedence ('chargeable under 4513') is expressed." },
+                    "lte": { "description": "INT or DATETIME attributes." },
+                    "gte": { "description": "INT or DATETIME attributes." }
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }

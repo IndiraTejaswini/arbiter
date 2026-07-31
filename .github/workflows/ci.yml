@@ -1,0 +1,326 @@
+name: CI
+
+# The architecture's central safety claim -- "no LLM can reach the decider,
+# and the world model cannot see the rulepack" -- is enforced by
+# import-linter contracts declared in pyproject.toml. Until this workflow
+# existed, nothing ever ran them: the contracts were a config file, not a
+# guarantee. Same for the property tests that verify prime-implicant
+# soundness and completeness.
+#
+# Ordering is deliberate and matches the architecture document's own
+# pipeline: lint -> unit -> rulepack property tests -> integration ->
+# adversarial suite. Cheap checks fail first.
+#
+# The property suite runs in two modes, and BOTH are wired up here. On every
+# push it runs its default budgets (`tests/property/strategies.py`), which for
+# every rulepack shipped today still means a full predicate-powerset sweep for
+# the implicant and conflict properties. The `exhaustive-property-tests` job
+# below sets FULL_POWERSET_SWEEP=1 nightly, which forces the powerset sweep
+# for EVERY property including the expensive advocate one, and for every
+# rulepack regardless of size. That split is what keeps a growing rulepack
+# corpus from either blowing up per-push CI time or silently losing its proof:
+# the proof keeps running, just not on the critical path.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # 03:14 UTC daily -- the exhaustive property sweep only.
+    - cron: "14 3 * * *"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  # Keep the suite honest about the defaults it is testing: CI must run with
+  # the dev-token route OFF and no auth secret, exactly as a fresh checkout
+  # would, so a regression that re-enables either fails here.
+  ARBITER_ENV: dev
+
+jobs:
+  backend:
+    name: backend (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: arbiter
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install ruff
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format check (ruff)
+        run: ruff format --check --diff .
+        continue-on-error: true  # advisory until the tree is fully formatted
+
+      # THE contract check. A violation here means an LLM-touching module can
+      # reach the referee, or the synthetic world model can see the rulepack
+      # it is supposed to be independent of -- which would make every
+      # accuracy number in the README circular while looking excellent.
+      - name: Architecture contracts (import-linter)
+        run: lint-imports --verbose
+
+      - name: Tests
+        run: python -m pytest tests/ -v --tb=short
+
+      # Reported separately from the rest of the suite because these are the
+      # architecture's correctness proofs, not feature tests. Default budgets:
+      # every rulepack under 16 predicates still gets a full powerset sweep for
+      # the implicant and conflict properties (see strategies.py), so this is
+      # the same proof it has always been for the corpus as it stands.
+      - name: Property tests (default budgets)
+        run: python -m pytest tests/property/ -v --tb=short
+
+  exhaustive-property-tests:
+    # The proof, at exponential cost, off the critical path.
+    #
+    # FULL_POWERSET_SWEEP=1 overrides every per-caller budget in
+    # strategies.py, so EVERY property -- including the advocate/referee
+    # consistency check, which pays a full dual-advocate search per assignment
+    # and is sampled by default -- runs over the complete predicate powerset
+    # for every rulepack. Runtime grows as 2**N per rulepack, which is exactly
+    # why it is nightly and not per-push.
+    #
+    # When this job starts timing out, that is the signal that a rulepack has
+    # outgrown a brute-force proof -- not a reason to delete the job. Split it
+    # per rulepack before weakening it.
+    name: property tests (exhaustive sweep)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: arbiter
+    env:
+      FULL_POWERSET_SWEEP: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # `-p no:randomly` is not needed and `-x` is deliberately absent: on a
+      # nightly proof run, knowing every property that broke is worth more
+      # than failing fast.
+      - name: Full powerset sweep
+        run: python -m pytest tests/property/ -v --tb=short --durations=15
+
+  supply-chain:
+    name: supply chain
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: arbiter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pinned tooling
+        run: python -m pip install --upgrade pip pip-tools pip-audit cyclonedx-bom
+
+      # The lockfile is the supply-chain boundary. If it no longer matches
+      # pyproject.toml, the image is being built from dependencies nobody
+      # reviewed -- so a drifted lockfile fails the build rather than being
+      # silently regenerated.
+      - name: Lockfile is in sync with pyproject.toml
+        run: |
+          cp requirements.lock requirements.lock.committed
+          pip-compile --quiet --generate-hashes --strip-extras             --output-file=requirements.lock pyproject.toml
+          diff -u requirements.lock.committed requirements.lock || {
+            echo "::error::requirements.lock is stale. Regenerate it:"
+            echo "  pip-compile --generate-hashes --strip-extras --output-file=requirements.lock pyproject.toml"
+            exit 1
+          }
+
+      # Every dependency installs by hash, exactly as the image does.
+      - name: Install from the lockfile with --require-hashes
+        run: pip install --require-hashes --no-deps -r requirements.lock
+
+      - name: Known vulnerabilities (pip-audit)
+        run: pip-audit --requirement requirements.lock --strict --progress-spinner off
+
+      - name: SBOM (CycloneDX)
+        run: cyclonedx-py requirements requirements.lock -o sbom.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: arbiter/sbom.json
+
+  image:
+    name: container image
+    runs-on: ubuntu-latest
+    needs: supply-chain
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # The slim target only: the full target pulls torch and a DeBERTa
+      # checkpoint, which is a multi-gigabyte download that belongs in a
+      # release pipeline rather than on every pull request.
+      - name: Build API image (slim target)
+        uses: docker/build-push-action@v6
+        with:
+          context: arbiter
+          target: runtime-slim
+          push: false
+          load: true
+          tags: arbiter-api:ci
+
+      - name: Image must not run as root
+        run: |
+          user=$(docker inspect --format '{{.Config.User}}' arbiter-api:ci)
+          test "$user" = "arbiter" || {
+            echo "::error::image runs as '${user:-root}' -- it must run as the unprivileged arbiter user"
+            exit 1
+          }
+
+      - name: Image must not ship test tooling
+        run: |
+          if docker run --rm --entrypoint sh arbiter-api:ci -c              "python -c 'import pytest' 2>/dev/null"; then
+            echo "::error::pytest is present in the runtime image"
+            exit 1
+          fi
+          echo "no dev dependencies in the runtime image"
+
+  evals:
+    name: evals (measured numbers still hold)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: arbiter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # Small n: this is a smoke test that the eval harness still runs and
+      # produces plausible numbers, not a re-measurement. The README's
+      # figures come from full-size runs. A crash here means the pipeline
+      # broke; a wildly different number means something real changed.
+      - name: Accuracy
+        run: python evals/accuracy.py --n 40
+      - name: Conformal coverage
+        run: python evals/calibration.py --n 220
+      - name: Fairness (A7)
+        run: python evals/fairness.py --n 120
+      - name: Deterministic latency
+        run: python evals/latency.py --n 40
+      - name: Gaming resistance
+        run: python evals/gaming_resistance.py --n 80
+
+      - name: Demo runs end to end with no infrastructure
+        run: python demo.py
+
+  migrations:
+    name: migrations apply to a real Postgres
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: arbiter
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: arbiter
+          POSTGRES_PASSWORD: arbiter
+          POSTGRES_DB: arbiter
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U arbiter -d arbiter"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      ARBITER_DATABASE_URL: postgresql+psycopg://arbiter:arbiter@localhost:5432/arbiter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # The ORM and the migrations drifted apart once already (naive
+      # timestamps in the models against timestamptz in the DDL). Applying
+      # the migrations and then asking Alembic whether the models still
+      # match is what catches that.
+      - name: alembic upgrade head
+        run: alembic upgrade head
+      - name: alembic downgrade base (migrations are reversible)
+        run: alembic downgrade base
+      - name: alembic upgrade head (again, from clean)
+        run: alembic upgrade head
+
+      - name: Seed and calibrate against a real database
+        run: |
+          python scripts/seed_demo.py
+          python scripts/seed_calibration.py --n 150
+
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: arbiter/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: arbiter/web/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # The frontend went a whole build without sending an Authorization
+      # header to an API that required one, because nothing ever compiled
+      # or exercised it in CI. `npm run build` runs tsc first, so a type
+      # error fails here rather than shipping.
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build (Vite)
+        run: npm run build
+        env:
+          VITE_API_BASE_URL: http://localhost:8000
+
+      - name: Bundle must stay static (no server runtime)
+        run: test -f dist/index.html && test -d dist/assets

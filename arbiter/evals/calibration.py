@@ -25,7 +25,6 @@ from arbiter.decision.conformal import ConformalAbstentionGate
 from arbiter.evidence import derive_predicate_facts
 from arbiter.horn import per_case_symmetry
 from arbiter.rulepack import load_rulepack_dir
-
 from datagen.observe import observe
 from datagen.outcome import Outcome, true_outcome
 from datagen.world import generate_world
@@ -62,8 +61,19 @@ def run(n_per_code: int, alpha: float, seed: int) -> None:
         split = n_per_code // 2
         cal_worlds, test_worlds = worlds[:split], worlds[split:]
 
+        n_cal_skipped = 0
         for w in cal_worlds:
             evaluation, confidence = _adjudicate_one(pack, referee, w)
+            # Only cases the gate could actually be asked to rule on belong in
+            # the pool. `decide()` returns before consulting the threshold
+            # when there is no decision, and those cases score exactly 1.0 --
+            # so admitting them puts a point mass at the top of a [0,1] range
+            # and pins the quantile to 1.0, at which point the gate
+            # auto-resolves everything and the coverage figure printed below
+            # describes a comparison that never rejected anything.
+            if not confidence.has_decision:
+                n_cal_skipped += 1
+                continue
             gate.add_calibration_example(reason_code, confidence.nonconformity())
 
         n_auto = 0
@@ -83,12 +93,21 @@ def run(n_per_code: int, alpha: float, seed: int) -> None:
 
         coverage = n_auto_correct / n_auto if n_auto else float("nan")
         auto_rate = n_auto / len(test_worlds)
-        within_target = abs(coverage - (1 - alpha)) <= 0.10 if n_auto >= 10 else None
-        print(f"\n{reason_code}  (calibration n={len(cal_worlds)}, test n={len(test_worlds)})")
+        _within_target = abs(coverage - (1 - alpha)) <= 0.10 if n_auto >= 10 else None
+        n_cal_used = len(cal_worlds) - n_cal_skipped
+        threshold = gate.threshold_for(reason_code)
+        print(f"\n{reason_code}  (calibration n={n_cal_used} usable of {len(cal_worlds)}, "
+              f"test n={len(test_worlds)})")
+        print(f"  {n_cal_skipped} calibration cases excluded (no decision -- the gate is "
+              f"never asked to rule on those)")
+        print(f"  threshold q_hat = {threshold:.4f}" if threshold is not None else "  threshold: none")
         print(f"  auto-resolved: {n_auto} ({auto_rate:.1%})   escalated: {n_escalate} ({1-auto_rate:.1%})")
         print(f"  empirical coverage on auto-resolved: {coverage:.1%}  (target {1-alpha:.0%})")
         if n_auto < 10:
-            print(f"  [too few auto-resolved cases in the test split for a stable coverage estimate]")
+            print("  [too few auto-resolved cases in the test split for a stable coverage estimate]")
+        if gate.is_inert(reason_code):
+            print("  [!] THRESHOLD IS AT THE TOP OF THE SCORE RANGE -- this gate cannot reject "
+                  "anything, so the coverage figure above is not evidence that it works")
 
 
 if __name__ == "__main__":

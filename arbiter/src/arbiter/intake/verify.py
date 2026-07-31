@@ -34,9 +34,16 @@ def verify_intent(result: Optional[IntentResult], available_rulepacks: set[str])
     4. classifier unavailable / unparseable (result=None) route to human triage
 
     Never silently guesses a rulepack -- every non-resolved path is either a
-    one-tap user confirmation or a human-triage queue entry, logged either
-    way (the API layer writes an INTENT_CLASSIFIED case_event regardless of
-    outcome).
+    one-tap user confirmation or a human-triage queue entry.
+
+    Where the non-resolved paths are recorded, stated accurately: in the API
+    RESPONSE (`IntentNotResolvedResponse`), not in `case_event`. This
+    docstring used to claim "the API layer writes an INTENT_CLASSIFIED
+    case_event regardless of outcome", which is not merely untrue but
+    unimplementable -- `case_event` is keyed by `case_id`, and an unresolved
+    intent is precisely the outcome in which NO case is created. Only the
+    resolved path gets an INTENT_CLASSIFIED event, written by
+    `create_dispute` once a case row exists to attach it to.
     """
     if result is None:
         return IntentDecision(

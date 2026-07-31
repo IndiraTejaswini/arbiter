@@ -36,8 +36,8 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
 
-from arbiter.evidence.models import EvidenceNode, EvidenceNodeType, ProvenanceTier
 from arbiter.evidence.graph import EvidenceGraph
+from arbiter.evidence.models import EvidenceNode, EvidenceNodeType, ProvenanceTier
 from arbiter.provenance.commitment import ProvenanceService
 from arbiter.provenance.merkle import TransparencyLog
 
@@ -148,8 +148,15 @@ def _observe_f29(graph: EvidenceGraph, world: World, rng: random.Random) -> Opti
             ProvenanceTier.NETWORK, rng)
 
     if world.cardholder_reported_lost_stolen:
-        _assert(graph, EvidenceNodeType.CLAIM, "cardholder_reported_card_lost_stolen", True,
-                ProvenanceTier.ASSERTED, rng, confidence=0.9)
+        # NETWORK, not ASSERTED: Reg Z 12 CFR 1026.12(b) turns on notice TO
+        # THE ISSUER, and Amex's record of receiving that notice is the
+        # legally operative fact. Modelling it as an unverifiable narrative
+        # claim was both factually wrong and a gaming vector, because
+        # F29_R_LOST_STOLEN decides the case on this predicate alone.
+        # ATTESTATION rather than CLAIM: this is the issuer attesting that
+        # notice was received, not the card member's own narrative.
+        _assert(graph, EvidenceNodeType.ATTESTATION, "cardholder_reported_card_lost_stolen", True,
+                ProvenanceTier.NETWORK, rng, confidence=0.9)
     # account_takeover_signal is Amex's own device/session-discontinuity
     # DETECTOR, not a readout of ground truth -- it must not simply copy
     # `account_was_taken_over` (that would make the F29_R_ATO rule

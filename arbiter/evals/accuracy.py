@@ -24,20 +24,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from arbiter.advocate import run_dual_advocacy
 from arbiter.decision import Referee
 from arbiter.evidence import derive_predicate_facts
-from arbiter.horn import counterfactuals_for_all_outcomes, per_case_symmetry
-from arbiter.decision.confidence import compute_confidence_vector
-from arbiter.decision.conformal import ConformalAbstentionGate
 from arbiter.rulepack import load_rulepack_dir
-
-from datagen.world import generate_world
-from datagen.outcome import Outcome, true_outcome
 from datagen.observe import observe
+from datagen.outcome import Outcome, true_outcome
+from datagen.world import generate_world
 
 RULEPACK_DIR = Path(__file__).resolve().parent.parent / "rulepacks" / "amex"
 
 _DECISION_TO_OUTCOME = {
     "MERCHANT_WINS": Outcome.MERCHANT_PREVAILS,
     "CARD_MEMBER_WINS": Outcome.CARD_MEMBER_PREVAILS,
+    "SPLIT": Outcome.SPLIT,
 }
 
 
@@ -48,7 +45,6 @@ def run_eval(n_per_code: int, seed: int) -> dict:
 
     results = defaultdict(lambda: Counter())
     r13_recovery = Counter()
-    auto_resolve_count = Counter()
     total = Counter()
 
     for reason_code in ("F29", "C08", "C02"):

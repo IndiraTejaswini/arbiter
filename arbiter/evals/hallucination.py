@@ -38,7 +38,6 @@ from arbiter.decision import Referee
 from arbiter.evidence import EvidenceNode, EvidenceNodeType, ProvenanceTier, derive_predicate_facts
 from arbiter.llm.client import is_available
 from arbiter.rulepack import load_rulepack_dir
-
 from datagen.observe import observe
 from datagen.world import generate_world
 

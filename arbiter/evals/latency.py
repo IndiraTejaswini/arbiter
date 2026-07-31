@@ -35,7 +35,6 @@ from arbiter.evidence import derive_predicate_facts
 from arbiter.horn import counterfactuals_for_all_outcomes, per_case_symmetry
 from arbiter.narrate import render_narration_safe
 from arbiter.rulepack import load_rulepack_dir
-
 from datagen.observe import observe
 from datagen.world import generate_world
 

@@ -13,7 +13,7 @@ with:
 - PT-4 reachability: every rule is firable by some satisfiable predicate set.
 - PT-5 acyclicity: head->body graph is a DAG (checked at rulepack load via
   arbiter.rulepack.validate; StratificationError would already have failed
-  the module-scoped `packs` fixture below if violated).
+  the session-scoped `packs` fixture in conftest.py if violated).
 - PT-6 completeness: every declared predicate is referenced; every body atom
   is declared (also checked at load time).
 - PT-7 tier soundness: covered structurally by arbiter.evidence.derive's
@@ -27,12 +27,18 @@ with:
   one of them as a false positive. What "no dictator" actually forbids --
   a predicate that wins even in the FACE OF contradicting evidence, by
   silently overriding rather than surfacing a conflict -- is covered by
-  test_conflicts_never_silently_resolved_exhaustive below: two rules firing
+  test_conflicts_never_silently_resolved below: two rules firing
   on genuinely independent predicates always produces a surfaced conflict,
   never a silent pick.
 - mutual exclusivity: no evidence assignment satisfies two outcomes at once
-  without it being surfaced as a conflict -- checked *exhaustively* over the
-  full predicate powerset per rulepack.
+  without it being surfaced as a conflict -- see `strategies.py` for how the
+  assignment space is enumerated now that a full powerset sweep no longer
+  scales, and which properties keep an exact proof at which rulepack sizes.
+- PT-10 chargeback right: every rulepack transcribes its reason code's
+  filing window and "Excluded Transactions" list from the Amex guide, and
+  the gate that evaluates them can never close on an empty attribute set.
+  The mirror of `test_no_trivial_prime_implicant` for the pre-referee
+  decider (`arbiter.eligibility`).
 - regression coverage for defects this build found and fixed while it was
   being written: a trivial empty-set prime implicant, and advocate/referee
   decision divergence.
@@ -42,19 +48,29 @@ from __future__ import annotations
 
 import itertools
 import json
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Dict
 
-import pytest
+from conftest import RULEPACK_DIR, skip_if_full_sweep
+from strategies import (
+    BUDGET_ADVOCATE_SEARCH,
+    BUDGET_SINGLE_EVALUATION,
+    assignment_matrix,
+    facts_for,
+    matrix_is_exhaustive,
+)
 
 from arbiter.advocate import run_dual_advocacy
 from arbiter.decision import Referee
-from arbiter.horn import Engine, Fact, FactStatus, RulePack, enumerate_prime_implicants
+from arbiter.eligibility import ATTRIBUTE_VOCABULARY, evaluate_chargeback_right
+from arbiter.fairness import CaseRecord, compute_rule_level_disparate_impact, flagged_only
+from arbiter.horn import Fact, FactStatus, enumerate_prime_implicants
 from arbiter.narrate import render_narration_safe
 from arbiter.rulepack import load_rulepack_dir
-from arbiter.fairness import CaseRecord, compute_rule_level_disparate_impact, flagged_only
 
-RULEPACK_DIR = Path(__file__).resolve().parent.parent.parent / "rulepacks" / "amex"
+# `packs`, `engine` and `synthetic_pack` come from conftest.py -- three test
+# modules consume them now, and re-parsing the rulepack YAML per module was
+# wasted work.
 
 # banned substrings: predicates must describe *evidence*, never a party
 # classification attribute. A rule conditioning on any of these would be
@@ -63,16 +79,6 @@ _PROTECTED_ATTRIBUTE_PATTERNS = (
     "tier", "segment", "premium", "region", "age", "gender", "race",
     "ethnicity", "income", "credit_score", "zip", "postal",
 )
-
-
-@pytest.fixture(scope="module")
-def packs() -> Dict[str, RulePack]:
-    return load_rulepack_dir(RULEPACK_DIR)
-
-
-@pytest.fixture(scope="module")
-def engine() -> Engine:
-    return Engine()
 
 
 def _facts_exactly_satisfying(mwc, extra_true: Dict[str, bool] = None) -> Dict[str, Fact]:
@@ -114,8 +120,8 @@ def test_no_trivial_prime_implicant(packs):
 # ---------------------------------------------------------------- PT-3 determinism
 
 def test_determinism_same_facts_same_hash(packs, engine):
-    for code, pack in packs.items():
-        for outcome, head in pack.decision_predicates.items():
+    for pack in packs.values():
+        for head in pack.decision_predicates.values():
             for mwc in enumerate_prime_implicants(pack, head)[:3]:
                 facts = _facts_exactly_satisfying(mwc)
                 r1 = engine.evaluate(pack, facts)
@@ -188,27 +194,29 @@ def test_no_protected_attribute_predicates(packs):
 
 # ---------------------------------------------------------------- conflicts are never silently resolved (exhaustive)
 
-def test_conflicts_never_silently_resolved_exhaustive(packs, engine):
+def test_conflicts_never_silently_resolved(packs, engine):
     """
     Evidence CAN legitimately satisfy two outcomes' rules at once -- e.g.
     C02_R4 (service_never_rendered) and C02_R8 (dispute_filed_before_
     return_received) reference independent predicates a real case could
-    assert simultaneously. What this test verifies, exhaustively over the
-    full predicate powerset per rulepack: whenever multiple outcomes fire,
-    `decision` is always None and `conflicting_outcomes` always lists
-    exactly the outcomes that fired -- the conflict is surfaced, never
-    silently arbitrated by dict/iteration order.
+    assert simultaneously. What this test verifies: whenever multiple
+    outcomes fire, `decision` is always None and `conflicting_outcomes`
+    always lists exactly the outcomes that fired -- the conflict is
+    surfaced, never silently arbitrated by dict/iteration order.
+
+    One `Engine.evaluate` per assignment, so this runs under the cheap
+    budget and stays a full powerset sweep for every rulepack shipped today.
+    When a rulepack outgrows the budget, the matrix still contains every
+    cross-outcome implicant pair by construction
+    (`strategies.structural_assignments`) -- which is where a conflict can
+    arise at all, since firing two outcomes requires satisfying an implicant
+    of each. Random sampling would reach those rows only by luck.
     """
     for code, pack in packs.items():
-        edb = sorted(pack.edb_predicates())
         heads_by_outcome = pack.decision_predicates
         checked_conflicts = 0
-        for bits in itertools.product([False, True], repeat=len(edb)):
-            facts = {
-                p: Fact(p, FactStatus.TRUE, (f"n_{p}",))
-                for p, is_true in zip(edb, bits) if is_true
-            }
-            result = engine.evaluate(pack, facts)
+        for assignment in assignment_matrix(pack, exhaustive_budget=BUDGET_SINGLE_EVALUATION):
+            result = engine.evaluate(pack, facts_for(assignment))
             fired_outcomes = {o for o, h in heads_by_outcome.items() if h in result.true_predicates}
 
             if len(fired_outcomes) > 1:
@@ -230,24 +238,72 @@ def test_conflicts_never_silently_resolved_exhaustive(packs, engine):
             assert checked_conflicts > 0, "expected C02's known-independent predicates to produce some conflicts"
 
 
+@skip_if_full_sweep
+def test_conflict_surfacing_survives_sampling_on_a_large_rulepack(engine, synthetic_pack):
+    """The same property on a rulepack too big to sweep, so the sampled path
+    is exercised now rather than by whoever lands the first large rulepack.
+
+    Asserts the generator actually delivers conflicts: if the matrix reached
+    no two-outcome assignment, the test above would pass vacuously in sampled
+    mode, which is precisely how a sampled property test becomes worthless
+    without anyone noticing.
+    """
+    pack = synthetic_pack(24)
+    assert not matrix_is_exhaustive(pack, BUDGET_SINGLE_EVALUATION)
+
+    conflicts = 0
+    for assignment in assignment_matrix(pack, exhaustive_budget=BUDGET_SINGLE_EVALUATION):
+        result = engine.evaluate(pack, facts_for(assignment))
+        fired = {o for o, h in pack.decision_predicates.items() if h in result.true_predicates}
+        if len(fired) > 1:
+            conflicts += 1
+            assert result.decision is None
+            assert set(result.conflicting_outcomes) == fired
+        elif len(fired) == 1:
+            assert result.decision in fired
+            assert result.conflicting_outcomes == ()
+    assert conflicts > 0, (
+        "the sampled matrix produced no multi-outcome assignment, so conflict surfacing was "
+        "never actually checked -- the cross-outcome implicant-pair family in "
+        "strategies.structural_assignments is not doing its job"
+    )
+
+
 # ---------------------------------------------------------------- advocate/referee consistency
 
-def test_advocate_completeness_matches_referee_exhaustive(packs, engine):
+def test_advocate_completeness_matches_referee(packs, engine):
     """The consistency invariant the dual-advocate design depends on: if the
     objective facts alone would satisfy some outcome under a full
     Engine.evaluate(), the corresponding advocate must find and cite that
-    MWC, so the Referee's verified-fact-only evaluation reaches the exact
-    same decision. Checked exhaustively over a bounded predicate powerset
-    per rulepack (capped for runtime)."""
+    MWC, so the Referee reaches the exact same decision.
+
+    THE EXPENSIVE ONE, and the reason `strategies.py` takes a budget per
+    caller rather than one global threshold. Each assignment costs a full
+    `run_dual_advocacy` search plus two evaluations -- roughly forty times a
+    bare evaluation -- and the old full sweep over three rulepacks was 10 of
+    this suite's 13 seconds on its own. It runs under
+    `BUDGET_ADVOCATE_SEARCH`, so today's rulepacks are checked over the
+    covering matrix rather than the powerset.
+
+    That is a deliberate reduction in breadth, and it is defensible because
+    of what this test now guards. Read `arbiter.decision.adjudicate`'s module
+    docstring: the Referee evaluates the COMPLETE objective fact set, so
+    divergence is structurally impossible today and this test is a regression
+    guard against someone re-narrowing evaluation to the advocate-cited
+    subset. That failure is not diffuse across the input space -- it shows up
+    exactly where the cited subset differs from the full fact set, i.e. where
+    a fact BLOCKS a rule rather than satisfying one, since a minimal winning
+    coalition has no reason to cite a blocker. The matrix's
+    `implicant + blocker` family targets precisely those assignments, and it
+    is the shape of the original defect that docstring records
+    (facts={service_never_rendered: TRUE, refund_issued: TRUE}).
+
+    `FULL_POWERSET_SWEEP=1` restores the powerset sweep here too.
+    """
     referee = Referee(engine)
     for code, pack in packs.items():
-        edb = sorted(pack.edb_predicates())
-        sample_edb = edb[:12]
-        for bits in itertools.product([False, True], repeat=len(sample_edb)):
-            facts = {
-                p: Fact(p, FactStatus.TRUE, (f"n_{p}",))
-                for p, is_true in zip(sample_edb, bits) if is_true
-            }
+        for assignment in assignment_matrix(pack, exhaustive_budget=BUDGET_ADVOCATE_SEARCH):
+            facts = facts_for(assignment)
             full_eval = engine.evaluate(pack, facts)
             cm_graph, m_graph = run_dual_advocacy(pack, facts)
             referee_result = referee.adjudicate(pack, [cm_graph, m_graph], facts)
@@ -255,6 +311,45 @@ def test_advocate_completeness_matches_referee_exhaustive(packs, engine):
                 f"{code}: referee decision {referee_result.evaluation.decision} diverged from "
                 f"full objective evaluation {full_eval.decision} for facts={sorted(facts)}"
             )
+
+
+def test_advocate_completeness_covers_blocking_facts(packs, engine):
+    """The specific regression the test above is a guard against, pinned
+    directly instead of left to the matrix.
+
+    For every rule with a negated literal, construct the assignment that
+    satisfies the rule's positive literals AND asserts the blocker true. The
+    rule must not fire, and the referee must agree with a full evaluation.
+    This is the `{service_never_rendered: TRUE, refund_issued: TRUE}` case
+    from `arbiter.decision.adjudicate`'s docstring, generalised over every
+    rulepack -- and unlike the matrix-driven test it cannot be weakened by a
+    future change to the sampling strategy.
+    """
+    referee = Referee(engine)
+    checked = 0
+    for code, pack in packs.items():
+        for rule in pack.rules:
+            blockers = [lit.predicate for lit in rule.body if lit.negated]
+            if not blockers:
+                continue
+            for blocker in blockers:
+                assignment = frozenset(
+                    [lit.predicate for lit in rule.body if not lit.negated] + [blocker]
+                )
+                facts = facts_for(assignment)
+                full_eval = engine.evaluate(pack, facts)
+                assert rule.rule_id not in full_eval.fired_rules, (
+                    f"{code}/{rule.rule_id}: fired even though its negated literal "
+                    f"{blocker!r} is asserted TRUE"
+                )
+                cm_graph, m_graph = run_dual_advocacy(pack, facts)
+                referee_result = referee.adjudicate(pack, [cm_graph, m_graph], facts)
+                assert referee_result.evaluation.decision == full_eval.decision, (
+                    f"{code}/{rule.rule_id}: referee diverged from full evaluation with blocker "
+                    f"{blocker!r} asserted -- a blocking fact was dropped from evaluation"
+                )
+                checked += 1
+    assert checked > 0, "no rulepack negates any literal -- this test is checking nothing"
 
 
 # ---------------------------------------------------------------- narration fallback
@@ -312,3 +407,219 @@ def test_disparate_impact_audit_catches_biased_rule_not_fair_rule():
     assert not any(f.rule_id == "RULE_FAIR" for f in flagged), "unbiased RULE_FAIR was falsely flagged"
     assert all(abs(f.delta) >= 0.15 for f in flagged)
     assert all(f.n_a >= 5 and f.n_b >= 5 for f in findings)
+
+
+# ------------------------------------------------- PT-9 tier-gating soundness
+
+def test_no_submitted_tier_predicate_wins_alone(packs):
+    """A rulepack-authoring invariant, checked mechanically rather than by
+    comment:
+
+        A rule that DECIDES a case may rest on weak-tier (SUBMITTED /
+        ASSERTED) predicates only if it ALSO constrains at least one
+        NETWORK- or COMMITTED-tier predicate -- positively or negatively.
+
+    Why tier gating carries this weight: it is the disclosure-safety
+    property the counterfactual ledger depends on. A losing party reads
+    their own counterfactual, which names exactly the predicates they need.
+    If any of those is satisfiable by a self-supplied document AND decisive
+    on its own, the counterfactual is a fabrication recipe.
+
+    Not hypothetical: C08_R4 fired on `cardholder_confirmed_receipt` ALONE
+    at SUBMITTED tier, and `evals/gaming_resistance.py` measured 95 of 99
+    fabricated cases flipping the verdict. Forensics and contradiction
+    detection are real defenses but not substitutes -- a forgery good
+    enough to pass forensics won that case unopposed.
+
+    WHY A NEGATED NETWORK LITERAL COUNTS. `X_submitted AND NOT Y_network`
+    is a materially different risk from `X_submitted` alone: an attacker
+    controls only half of it. They can forge X, but they cannot forge the
+    *absence* of Y from Amex's own records -- you cannot manufacture an
+    absence in a system you do not write to. So C02_R2's
+    `merchant_refund_promise_on_record AND NOT refund_issued` is sound
+    (`refund_issued` is NETWORK), while a rule constraining nothing at
+    NETWORK tier at all is not.
+    """
+    weak_tiers = {"SUBMITTED", "ASSERTED"}
+    strong_tiers = {"NETWORK", "COMMITTED"}
+    violations = []
+
+    for code, pack in packs.items():
+        if not pack.predicate_meta:
+            continue
+        decision_heads = set(pack.decision_predicates.values())
+        for rule in pack.rules:
+            if rule.head not in decision_heads:
+                continue  # only rules that decide the case are gated this way
+
+            # Every literal the rule constrains, negated or not.
+            constrained = {
+                lit.predicate: pack.predicate_meta[lit.predicate].min_tier
+                for lit in rule.body if lit.predicate in pack.predicate_meta
+            }
+            if not constrained:
+                continue
+
+            has_strong_anchor = any(t in strong_tiers for t in constrained.values())
+            weak_positive = [
+                lit.predicate for lit in rule.body
+                if not lit.negated
+                and constrained.get(lit.predicate) in weak_tiers
+            ]
+            if weak_positive and not has_strong_anchor:
+                violations.append(
+                    f"{code}/{rule.rule_id}: decides on {weak_positive} at "
+                    f"{[constrained[p] for p in weak_positive]} tier and constrains "
+                    f"NOTHING at NETWORK/COMMITTED tier -- a party can satisfy this "
+                    f"rule entirely from material it supplies itself"
+                )
+
+    assert not violations, "tier-gating violations:\n  " + "\n  ".join(violations)
+
+
+# ------------------------------------------- CE3.0 threshold-form equivalence
+
+# The five bodies F29's CE3.0 family had before it was re-authored with
+# `at_least` (rulepack version 1.0.0). Kept literally, not regenerated, so
+# this is a genuine independent statement of the target rather than a
+# restatement of the code under test.
+_CE3_HAND_WRITTEN_PAIRS = [
+    ("device_id_match", "ip_address_match"),
+    ("device_id_match", "shipping_address_match"),
+    ("device_id_match", "user_id_match"),
+    ("ip_address_match", "shipping_address_match"),
+    ("ip_address_match", "user_id_match"),
+]
+_CE3_COMMON = ("prior_undisputed_txn_count_ge_2", "prior_txn_120_to_365_days_old")
+
+
+def test_ce3_threshold_expansion_matches_hand_written_pairs(packs):
+    """The re-authoring of F29's CE3.0 family onto `at_least` was a change of
+    notation, not of policy -- so it has to be provable as one.
+
+    Visa CE3.0 is "at least 2 of {device_id, ip_address, shipping_address,
+    user_id} match a prior undisputed transaction, at least one of which is
+    device_id or ip_address". That is every 2-subset except
+    {shipping_address, user_id}, which is why it is authored as two anchored
+    threshold rules rather than one flat `at_least: 2` -- a flat 2-of-4 would
+    silently admit the one pair CE3.0 excludes, and the excluded pair is
+    precisely the one with no network-recorded identifier in it.
+    """
+    pack = packs["F29"]
+    ce3_bodies = {
+        frozenset(lit.predicate for lit in rule.body)
+        for rule in pack.rules if rule.rule_id.startswith("F29_CE3")
+    }
+    expected = {frozenset(_CE3_COMMON + pair) for pair in _CE3_HAND_WRITTEN_PAIRS}
+    assert ce3_bodies == expected
+
+    # No rule negates anything in this family, so predicate-set equality
+    # above is the whole story; assert that rather than leave it implied.
+    assert not any(
+        lit.negated for rule in pack.rules if rule.rule_id.startswith("F29_CE3") for lit in rule.body
+    )
+
+
+def test_ce3_excluded_pair_still_loses(packs, engine):
+    """The negative half of CE3.0, which the threshold form must not erode:
+    shipping_address + user_id, with no device or IP match, is NOT compelling
+    evidence and must not derive merchant_wins."""
+    facts = {
+        p: Fact(p, FactStatus.TRUE, (f"n_{p}",))
+        for p in _CE3_COMMON + ("shipping_address_match", "user_id_match")
+    }
+    assert "merchant_wins" not in engine.evaluate(packs["F29"], facts).true_predicates
+
+
+# ------------------------------------------- chargeback right (arbiter.eligibility)
+
+def test_every_rulepack_declares_a_chargeback_right(packs):
+    """Every reason code in the Amex guide has an "Excluded Transactions"
+    entry and a "Maximum time a dispute can be raised" entry -- including the
+    codes whose exclusion list reads "None". A rulepack that declares no
+    `chargeback_right:` block has not been checked against the guide at all,
+    and the gate silently passes every dispute under it."""
+    for code, pack in packs.items():
+        assert pack.chargeback_right is not None, (
+            f"{code}: no chargeback_right block -- the reason code's filing window and "
+            f"excluded transactions have not been transcribed from the Amex guide"
+        )
+        assert pack.chargeback_right.network_code, f"{code}: chargeback_right declares no network_code"
+        assert pack.chargeback_right.source, (
+            f"{code}: chargeback_right cites no source -- a gate that can end a dispute "
+            f"has to say which published rule it came from"
+        )
+
+
+def test_network_codes_are_unique_across_rulepacks(packs):
+    """Two rulepacks claiming 4540 would make routing by network code
+    ambiguous, and the registry resolves in dict order -- i.e. arbitrarily."""
+    seen = {}
+    for code, pack in packs.items():
+        network_code = pack.chargeback_right.network_code
+        assert network_code not in seen, (
+            f"network code {network_code} claimed by both {seen.get(network_code)} and {code}"
+        )
+        seen[network_code] = code
+
+
+def test_exclusions_reference_only_vocabulary_attributes(packs):
+    """Load-time validation already enforces this
+    (arbiter.rulepack.validate), but it is worth a property test of its own:
+    it is the mechanism that makes a typo in an exclusion a boot failure
+    instead of a gate that quietly never fires."""
+    for code, pack in packs.items():
+        for exclusion in pack.chargeback_right.exclusions:
+            for condition in exclusion.conditions:
+                assert condition.attribute in ATTRIBUTE_VOCABULARY, (
+                    f"{code}/{exclusion.exclusion_id}: {condition.attribute!r} is not a "
+                    f"declared eligibility attribute"
+                )
+
+
+def test_no_exclusion_reads_a_rulepack_predicate(packs):
+    """The separation that justifies having two mechanisms at all.
+
+    An exclusion decides whether the dispute is chargeable; a predicate is
+    evidence in a dispute that is. If an attribute name were also a
+    predicate name, the same fact would be doing both jobs -- and the one
+    thing the gate must never become is another way for a party to win an
+    argument.
+    """
+    for code, pack in packs.items():
+        predicates = set(pack.predicate_schema) | pack.edb_predicates()
+        for exclusion in pack.chargeback_right.exclusions:
+            for condition in exclusion.conditions:
+                assert condition.attribute not in predicates, (
+                    f"{code}/{exclusion.exclusion_id}: {condition.attribute!r} is both an "
+                    f"eligibility attribute and a rulepack predicate"
+                )
+
+
+def test_gate_never_fires_on_an_empty_attribute_set(packs):
+    """The mirror of `test_no_trivial_prime_implicant`, for the other
+    decider. A rulepack whose exclusions fire on no information at all would
+    bar every dispute under that reason code -- the most destructive possible
+    authoring error here, and the cheapest to test for."""
+    filed_at = datetime(2026, 7, 27, tzinfo=timezone.utc)
+    for code, pack in packs.items():
+        result = evaluate_chargeback_right(pack.chargeback_right, {}, filed_at)
+        assert result.available is True, (
+            f"{code}: the chargeback-right gate closed on an empty attribute set -- "
+            f"an unknown must never exclude (arbiter.eligibility.models)"
+        )
+
+
+def test_every_decisive_predicate_declares_a_tier(packs):
+    """A predicate with no `min_tier` entry is ungated by default, which is
+    the failure mode that made tier gating a silent no-op in an earlier
+    build: PredicateMeta was fully implemented and no shipped rulepack
+    populated a `predicates:` block, so `_min_tier_for` always returned
+    None."""
+    missing = []
+    for code, pack in packs.items():
+        assert pack.predicate_meta, f"{code} declares no `predicates:` block -- tier gating would be a no-op"
+        for pred in pack.predicate_schema:
+            if pred not in pack.predicate_meta:
+                missing.append(f"{code}/{pred}")
+    assert not missing, f"predicates with no declared min_tier: {missing}"

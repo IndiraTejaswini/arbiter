@@ -18,7 +18,7 @@ fact that's true, known to the graph, and would have *blocked* a rule (a
 negative literal's predicate turning out TRUE) could simply never get
 mentioned by either side and silently drop out of evaluation, making
 outcomes more permissive than the evidence actually supports. Covered by
-tests/property/test_rulepacks.py::test_advocate_completeness_matches_referee_exhaustive
+tests/property/test_rulepacks.py::test_advocate_completeness_matches_referee
 against facts={service_never_rendered: TRUE, refund_issued: TRUE}, where a
 refund-issued rule should be blocked by refund_issued but wasn't, because no
 advocate's minimal winning coalition happened to cite it.

@@ -39,6 +39,14 @@ class Narration:
         return {
             "text": self.text,
             "source": self.source,
+            # The sentence split is part of the contract, not an internal
+            # detail: `Citation.sentence_idx` indexes THIS tuple. Omitting it
+            # forced every reader to re-derive the split from `text` and hope
+            # the result matched -- and a client that splits on "." gets a
+            # different answer the moment a sentence contains "12 CFR
+            # 1005.11", which these sentences routinely do. Citations then
+            # attach to the wrong sentence, or to none.
+            "sentences": list(self.sentences),
             "citations": [c.to_dict() for c in self.citations],
         }
 

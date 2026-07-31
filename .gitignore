@@ -10,6 +10,7 @@ build/
 *.egg-info/
 .env
 .env.local
+.artifact-store/
 web/.next/
 web/node_modules/
 *.db

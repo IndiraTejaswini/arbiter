@@ -33,6 +33,32 @@ dev = [
     "pytest-asyncio>=0.24",
     "hypothesis>=6.115",
     "import-linter>=2.1",
+    "ruff>=0.6",
+    "pip-audit>=2.7",
+]
+
+# The semantic contradiction layer (arbiter.evidence.nli). Optional as a
+# PACKAGE, mandatory as a LAYER: without it the layer reports UNAVAILABLE
+# and every case with comparable claim pairs escalates, which is correct
+# fail-closed behaviour but a permanently degraded mode. Split out because
+# torch is ~800 MB and the decision core, the property tests, and every
+# eval run without it.
+#
+#   pip install -e ".[nli]" && python scripts/fetch_nli_model.py
+#
+# CPU wheels are sufficient -- this is a cross-encoder over short,
+# highly-templated claim pairs, not a training workload.
+nli = [
+    "transformers>=4.44",
+    "torch>=2.4",
+    "sentencepiece>=0.2",   # DeBERTa-v3 tokenizer
+    "protobuf>=4.25",
+]
+
+# Object storage for retained artifacts (Reg E 1005.11(d)). Optional so a
+# laptop run falls back to the local filesystem rather than failing.
+s3 = [
+    "minio>=7.2",
 ]
 
 [tool.setuptools.packages.find]
@@ -41,6 +67,42 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src", "."]
+extend-exclude = [".import_linter_cache", ".pytest_cache", "web"]
+
+[tool.ruff.lint]
+# Deliberately narrow: real defects, not style opinions. This codebase was
+# written without a linter, so turning on the full ruleset would produce
+# hundreds of findings that bury the handful that matter. E501 (line
+# length) is off because the prose-heavy explanatory comments this codebase
+# relies on are more valuable than an 88-column rule.
+select = [
+    "F",    # pyflakes: undefined names, unused imports, unused variables
+    "E9",   # syntax / IO errors
+    "B",    # bugbear: mutable defaults, closures over loop variables, silent except
+    "I",    # import sorting
+]
+# `UP` (pyupgrade) is deliberately NOT enabled. It flags ~430 uses of
+# typing.Dict/List/Tuple, which this codebase uses consistently alongside
+# `from __future__ import annotations`. Rewriting all of them is churn with
+# real regression surface and no defect fixed -- a linter that forces a
+# 430-file diff on its first run gets switched off, and then it catches
+# nothing. Consistency with the surrounding code beats the newer idiom here.
+ignore = [
+    "B008",  # FastAPI's Depends()/File() in defaults is the framework's own idiom
+    "B904",  # `raise ... from err`: HTTPException re-raises drop the cause deliberately
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Re-export surfaces: __init__.py imports names so callers can reach them.
+"src/arbiter/**/__init__.py" = ["F401"]
+# Tests reach into private state deliberately (e.g. asserting the
+# calibration pool stays sorted).
+"tests/**" = ["F401"]
 
 [tool.importlinter]
 root_packages = ["arbiter", "datagen"]
@@ -57,7 +119,8 @@ source_modules = ["arbiter.horn"]
 forbidden_modules = [
     "arbiter.ingest", "arbiter.advocate", "arbiter.narrate", "arbiter.intake",
     "arbiter.llm", "arbiter.db", "arbiter.api", "arbiter.network",
-    "arbiter.provenance", "arbiter.audit",
+    "arbiter.provenance", "arbiter.audit", "arbiter.auth", "arbiter.privacy",
+    "arbiter.fairness.cross_case",
     "sqlalchemy", "httpx", "fastapi", "redis", "openai", "anthropic",
 ]
 
@@ -94,4 +157,20 @@ forbidden_modules = ["arbiter.horn", "arbiter.rulepack", "arbiter.evidence.deriv
 [[tool.importlinter.contracts]]
 name = "Layering"
 type = "layers"
-layers = ["arbiter.api", "arbiter.decision", "arbiter.evidence", "arbiter.horn", "arbiter.core"]
+layers = ["arbiter.api", "arbiter.decision", "arbiter.evidence", "arbiter.horn", "arbiter.eligibility", "arbiter.core"]
+
+[[tool.importlinter.contracts]]
+# The chargeback-right gate (filing window + excluded transactions) decides
+# whether a dispute may be charged back at all, before the referee runs. It
+# is held to the same purity standard as the referee for the same reason:
+# it can END a case, so nothing probabilistic, networked, or LLM-touching
+# may reach it. Its only inputs are typed transaction attributes and a
+# content-addressed rulepack block.
+name = "Chargeback-right gate is pure -- the pre-referee decider touches no LLM"
+type = "forbidden"
+source_modules = ["arbiter.eligibility"]
+forbidden_modules = [
+    "arbiter.ingest", "arbiter.advocate", "arbiter.narrate", "arbiter.intake",
+    "arbiter.llm", "arbiter.db", "arbiter.api", "arbiter.network", "arbiter.horn",
+    "sqlalchemy", "httpx", "fastapi", "redis", "openai", "anthropic",
+]
